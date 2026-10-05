@@ -1,0 +1,13 @@
+{
+  "name": "rig webCLI",
+  "short_name": "rig webCLI",
+  "description": "Retarget BVH mocap onto any skinned character and export an animated GLB. 100% local.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d0f1a",
+  "theme_color": "#0d0f1a",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

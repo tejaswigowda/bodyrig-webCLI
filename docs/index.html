@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0d0f1a">
+  <meta name="description" content="Retarget BVH mocap onto any skinned character and export an animated, web-optimized GLB. 100% local: nothing leaves your browser.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="rig webCLI">
+  <title>rig webCLI</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    { "imports": {
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/addons/"
+    } }
+  </script>
+</head>
+<body>
+<header>
+  <h1>rig webCLI</h1>
+  <span class="pill">mocap retargeting</span>
+  <span class="badge-local" title="Verify in DevTools, Network tab">&#9679; 100% local &middot; zero egress</span>
+  <a class="gh-link" href="https://github.com/tejaswigowda/rig-webCLI" target="_blank" rel="noopener">GitHub</a>
+</header>
+
+<div class="container">
+  <div class="statusbar"><span class="dot" id="dot"></span><span id="statusText">Drop a character and a BVH to begin.</span></div>
+
+  <div class="layout">
+    <!-- LEFT: inputs and the three levels of control -->
+    <div class="col">
+      <div class="card">
+        <div class="card-header">1 &middot; Inputs</div>
+        <div class="card-body">
+          <div class="drop-zone" id="drop" tabindex="0">
+            <strong>Drop files here or click to browse</strong>
+            <small>Character: FBX, GLB, glTF, VRM, Mesquite rig.json<br>Motion: BVH &middot; Optional: a saved bone map (.json)</small>
+          </div>
+          <input type="file" id="fileInput" multiple hidden accept=".fbx,.glb,.gltf,.vrm,.json,.bvh">
+          <div class="chips" id="chips"></div>
+          <button class="btn btn-ghost btn-sm" id="btnSample">Try with the sample (X Bot + 33 s mocap)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">2 &middot; Presets and options</div>
+        <div class="card-body">
+          <div class="presets" id="presets"></div>
+          <div class="grid2">
+            <label class="field">FPS<input type="number" id="fps" min="1" max="240" step="1" value="30"></label>
+            <label class="field">Mesh compression<select id="level"><option value="medium">medium</option><option value="high">high</option></select></label>
+            <label class="field">Trim start (s)<input type="number" id="trimStart" min="0" step="0.1" placeholder="0"></label>
+            <label class="field">Trim end (s)<input type="number" id="trimEnd" min="0" step="0.1" placeholder="end"></label>
+            <label class="field">Max texture (px)<input type="number" id="maxTex" min="0" step="256" placeholder="original"></label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="inPlace"> In place</label>
+            <label><input type="checkbox" id="loop"> Loop (close cycle)</label>
+            <label><input type="checkbox" id="align" checked> Align reference pose</label>
+            <label><input type="checkbox" id="optimize" checked> Meshopt compress</label>
+          </div>
+          <button class="btn btn-primary btn-block" id="btnBake" disabled>Bake &amp; export GLB</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">3 &middot; Command <span class="pill">raw control</span></div>
+        <div class="card-body">
+          <div class="cmdline"><span class="prompt">$</span><input type="text" id="cmd" class="cmd" spellcheck="false" autocomplete="off" value="bake"><button class="btn btn-ghost btn-sm" id="btnRun">Run</button></div>
+          <div class="note">Every control above is just this command. Edit it directly, or run <b>help</b>.</div>
+          <details>
+            <summary class="note" style="cursor:pointer"><b>Example library</b></summary>
+            <div class="examples" id="examples" style="margin-top:8px"></div>
+          </details>
+          <div class="log" id="log" aria-live="polite"></div>
+        </div>
+      </div>
+
+      <details class="card">
+        <summary class="card-header">Live stream <span class="pill">record, then bake</span></summary>
+        <div class="card-body">
+          <div class="note">Connect to a BVH-style WebSocket on your own machine or LAN (e.g. Mesquite). The page only reads; it never sends. See README for the frame format. If the stream has no hierarchy header, load a BVH first and its skeleton is used.</div>
+          <input type="text" id="liveUrl" value="ws://localhost:3000" spellcheck="false">
+          <div class="row">
+            <button class="btn btn-ghost btn-sm" id="btnLiveConnect">Connect</button>
+            <button class="btn btn-ghost btn-sm" id="btnLiveStop" disabled>Stop</button>
+            <button class="btn btn-primary btn-sm" id="btnLiveUse" disabled>Use recording as motion</button>
+          </div>
+          <div class="note" id="liveStatus">Not connected.</div>
+        </div>
+      </details>
+
+      <details class="card">
+        <summary class="card-header">Local AI assist <span class="pill">optional, off by default</span></summary>
+        <div class="card-body">
+          <div class="note">The core pipeline is deterministic geometry and never needs this. The model only labels bones the synonym table missed and turns plain English into a command. Every label is re-checked geometrically before it is used. Loading downloads about 1 GB of weights once (the only network use in this app); your files are never sent.</div>
+          <button class="btn btn-ghost btn-sm" id="btnAiLoad">Load model</button>
+          <div class="progress" id="aiProgress" hidden><div></div></div>
+          <div class="note" id="aiStatus"></div>
+          <div id="aiTools" hidden>
+            <div class="row"><button class="btn btn-ghost btn-sm" id="btnAiLabel">Label unmapped bones</button></div>
+            <div class="row" style="margin-top:8px"><input type="text" id="aiPrompt" class="grow" placeholder="trim to 2 to 10 s, 30 fps, loop, in place"><button class="btn btn-ghost btn-sm" id="btnAiCmd">To command</button></div>
+          </div>
+          <div class="note" id="aiStats"></div>
+        </div>
+      </details>
+    </div>
+
+    <!-- RIGHT: preview, result, mapping, stages -->
+    <div class="col">
+      <div class="card">
+        <div class="viewer-host" id="viewer"><div class="viewer-empty" id="viewerEmpty">Preview appears here</div></div>
+        <div class="transport">
+          <button class="btn btn-ghost btn-sm" id="btnPlay" disabled>Play</button>
+          <input type="range" id="scrub" min="0" max="1000" value="0" disabled>
+          <span class="time" id="time">0.00 / 0.00 s</span>
+        </div>
+      </div>
+
+      <div class="card" id="resultCard" hidden>
+        <div class="card-header">Result</div>
+        <div class="card-body">
+          <div class="note" id="resultInfo"></div>
+          <div class="row"><button class="btn btn-success" id="btnDownload">Download GLB</button><button class="btn btn-ghost" id="btnDownloadRaw" hidden>Download universal GLB</button><button class="btn btn-ghost" id="btnDownloadUsdz">Download USDZ (macOS Preview)</button></div>
+          <div class="note" id="resultHint" hidden>The compressed GLB uses EXT_meshopt_compression and KHR_mesh_quantization: it loads in three.js, Babylon.js and model-viewer. The universal GLB is plain glTF 2.0 for other viewers. macOS Preview and Quick Look cannot open GLB at all; use the USDZ there.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Bone mapping <span class="row" style="gap:6px;text-transform:none;letter-spacing:0">
+          <label class="note"><input type="checkbox" id="mapCore" checked> core only</label>
+          <button class="btn btn-ghost btn-sm" id="btnAutoMap" disabled>Auto-map</button>
+          <button class="btn btn-ghost btn-sm" id="btnSaveMap" disabled>Save map</button>
+          <button class="btn btn-ghost btn-sm" id="btnLoadMap">Load map</button>
+          <input type="file" id="mapInput" accept=".json" hidden>
+        </span></div>
+        <div class="card-body">
+          <div class="advice" id="advice"><span class="note">Load a character and a BVH to see how bones map.</span></div>
+          <div class="map-scroll" id="mapScroll" hidden><table class="map"><thead><tr><th>Character bone</th><th>Canonical</th><th>BVH bone</th></tr></thead><tbody id="mapBody"></tbody></table></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Pipeline stages</div>
+        <div class="card-body"><div class="stages" id="stages"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="card">
+    <div class="card-header">Privacy and limits</div>
+    <div class="card-body">
+      <div class="note"><b>Zero egress.</b> Your character, motion and exported GLB never leave this device. Open DevTools, Network tab, and run a bake: only static files from this site are requested, and none after the first load once the service worker has cached them.</div>
+      <ul>
+        <li>No foot-lock or IK yet: very short or long legged targets can slide.</li>
+        <li>Swing-only alignment fixes direction, not roll: differing rest roll can twist forearms.</li>
+        <li>FBX is the least predictable input (twin bones, units, external textures); GLB is cleaner.</li>
+        <li>Large textured characters are texture-bound on export; use --max-tex on phones.</li>
+        <li>Tested on Mixamo and synthetic A-pose / Blender-axis rigs. Real Blender, VRM, Ready Player Me, twist bones and non-humanoids are still untested.</li>
+      </ul>
+      <div class="note">Part of the <a href="https://arxiv.org/abs/2608.28950" target="_blank" rel="noopener">Web-CLI</a> family with ffmpeg-webCLI, whisper-webCLI, 3mf-webCLI and Strata.</div>
+    </div>
+  </div>
+</footer>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

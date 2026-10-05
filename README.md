@@ -1,0 +1,143 @@
+# rig webCLI
+
+A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM or Mesquite `rig.json`) and a BVH motion, retarget the motion onto the character's **own skeleton**, and export an animated, web-optimized **GLB**.
+<b><ins>No uploads, no servers: everything happens in your browser.</ins></b> Pure ES modules, no build step for the app (three.js and the optimizer are vendored in `docs/vendor`, so the whole app is same-origin and works offline).
+
+## Paper
+
+This tool is a reference implementation of the **Web-CLI** architecture, applied to a new domain (skeletal animation / mocap retargeting):
+
+> **The Web-CLI: Verifiable Privacy for Tools, Models, and Inference Engines in the Browser**
+> Tejaswi Gowda, Arizona State University.
+> arXiv: https://arxiv.org/abs/2608.28950
+
+Part of the Web-CLI family, alongside [ffmpeg-webCLI](https://github.com/tejaswigowda/ffmpeg-webCLI), [whisper-webCLI](https://github.com/tejaswigowda/whisper-webCLI), [3mf-webCLI](https://github.com/tejaswigowda/3mf-webCLI) and [Strata](https://github.com/tejaswigowda/strata-editor).
+
+## Run it
+
+```bash
+npm install     # dev tooling only (tests, vendoring); the app itself needs nothing
+npm start       # http://127.0.0.1:8010 (any static host works; no COOP/COEP needed)
+```
+
+Click **Try with the sample**, or drop a character and a BVH on the page. A bake starts as soon as both are loaded.
+
+## The four Web-CLI properties
+
+| Property | How it is met here |
+| --- | --- |
+| **Fidelity** | Every control is a flag of one raw command (`bake --fps 30 --trim 2:10 --in-place --map map.json`). A bone-mapping table exposes and edits every mapping decision. All seven pipeline stages are listed with timings and details. |
+| **Progressive disclosure** | Drop two files and get a GLB. Presets, then an example library, then the raw command line and the mapping table. Non-experts never see a bone name. |
+| **Offline-first** | A service worker precaches the app shell and every vendored dependency. No model weights are needed for the core path. Installable as a PWA. |
+| **Zero egress** | The character, the motion and the GLB never leave the device. See [Verify zero egress](#verify-zero-egress). |
+
+## Core principle: geometry, not AI
+
+Retargeting is geometry with a right answer, so the core pipeline is 100% deterministic. An optional on-device model is confined to the genuinely fuzzy residue and the host validates every model output geometrically (see [Optional AI](#optional-local-ai-assist)).
+
+## The seven stages
+
+`docs/js/mocap-bake.mjs` is a reusable, dependency-light engine (only three.js). Stages 2 to 6 live there; stages 1 and 7 are in `loaders.js` and `pipeline.js`.
+
+1. **Load.** FBXLoader / GLTFLoader / ObjectLoader for the model, BVHLoader for motion. Textures are awaited so they can be re-encoded on export; textures that never resolve are dropped instead of failing the export.
+2. **Normalize rig.** Collapse FBX "twin" bones, rebind skins to one shared skeleton, put a common root at joint 0 (a glTF requirement).
+3. **Map bones.** Canonicalize names (`mixamorig`, `mm`, `Actor:` namespaces, VRoid `J_Bip_*`, UE and Rigify styles), resolve through a synonym table. Unmapped bones hold the rest pose.
+4. **Align reference pose.** Swing each mapped bone so its direction matches the BVH rest direction, across unmapped intermediate bones. This is what makes A-poses and non-Mixamo axes work, and what the naive local-quaternion copy cannot do.
+5. **Transfer rotations.** World-delta transfer with sign-continuous quaternions.
+6. **Root motion.** The BVH hip trajectory scaled by the leg-length ratio, so feet stay on the floor at any character size. `--in-place` drops horizontal travel.
+7. **Export + optimize.** GLTFExporter writes a binary GLB; glTF-Transform with meshopt compresses it, in a Web Worker.
+
+## Command reference
+
+```
+bake [model] [motion] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align]
+     [--map FILE] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--out NAME]
+map  [--map FILE]     auto-map bones and print the table
+inspect               stage-by-stage report of the last bake
+usdz [--out NAME]     export the last bake as USDZ for macOS Preview / Quick Look
+help | clear
+```
+
+- `--trim 2:10`, `2:` and `:10` are all valid (seconds).
+- `--loop` makes the last frame equal the first; root travel resets unless combined with `--in-place`.
+- `--map FILE` takes a flat `{ "Canonical": "BVH bone" }` JSON file. Drop it on the page, or use **Save map** in the mapping panel (it registers itself, and the command updates to include `--map`). An empty string pins a bone to its rest pose.
+- Typing in the command box updates the controls and vice versa; the command is always the source of truth.
+
+## Live stream
+
+Connect to a BVH-style WebSocket on your own machine or LAN. The page only reads; it never sends. Messages are text:
+
+1. A BVH hierarchy header (text starting with `HIERARCHY`; a `MOTION` block, if present, is ignored). If the stream sends none, the hierarchy of the loaded BVH is used.
+2. One frame per message: whitespace-separated channel values in BVH order, a JSON array of numbers, or `{"t": seconds, "values": [...]}`. Frames without `t` are stamped on arrival.
+
+**Stop**, then **Use recording as motion**: the timestamped frames are resampled to a fixed fps (angles unwrapped, no flips) and baked exactly like a file.
+
+## Optional local AI assist
+
+Off by default and never required. **Load model** downloads about 1 GB of WebLLM weights once (the only network use in the app; your files are never sent). Following Strata's host-first split, the model only sees the fuzzy residue:
+
+- **Unknown bone labeling.** Bones the synonym table missed are labeled from a closed enum of the 22 canonical names with constrained decoding. The host then checks each label geometrically before accepting it: left bones on the left, chain order, up/down position, midline, plausible segment lengths. Wrong labels are rejected and listed, never baked.
+- **Natural language to options.** "trim to 2 to 10 s, 30 fps, loop, in place" becomes a command, which is validated by the real command grammar and shown for review before you run it.
+- **Explain the report.** Plain-language advice on unmapped bones is generated by deterministic rules, no model needed.
+
+The synonym table mapped every rig in the test set, so the app counts (locally, in `localStorage`, never sent) how often a bake leaves a core bone unmapped, to measure whether the model path is worth its weight.
+
+## When to use this instead of cloud tools
+
+Online retargeters and animation services upload your character and your capture data to a server. If those are unreleased game assets, a client's likeness, or research subjects, that upload is the problem. rig webCLI does the same retarget-and-export locally, deterministically, and you can prove nothing left the machine. Use a cloud tool when you need IK foot-lock, cleanup, or non-humanoid rigs that this does not handle yet (see below).
+
+## Verify zero egress
+
+Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled.
+
+## Testing (Playwright is the dev loop, not the product)
+
+```bash
+npm test                    # unit tests, then the Playwright matrix
+npm run test:update-golden  # regenerate tests/golden after an intentional change
+```
+
+`tests/matrix.mjs` drives the real page in headless Chromium: characters (X Bot, Y Bot, a synthetic Blender-axis A-pose rig built in the page) times option variants (default, trim + in-place + 24 fps, no-optimize). Each GLB must pass the **glTF validator with 0 errors**, stay under a **limb-direction error threshold** against the BVH source (mean 3 deg, p95 8 deg), keep its meshopt flag as requested, and match **golden joint positions**. It also runs a GUI smoke test, a live-stream round trip against a mock WebSocket device, the zero-egress assertion and an offline bake. Playwright never runs at runtime, since that would break zero egress.
+
+Current numbers on the committed fixtures (33 s of mocap, 994 frames at 30 fps):
+
+| Character | Bake + export time (no compression) | Mean limb error | GLB (raw, no compression) | GLB (meshopt) |
+| --- | --- | --- | --- | --- |
+| X Bot | about 0.15 s | 0.11 deg | 9.2 MB | 2.0 MB |
+| Y Bot | about 0.15 s | 0.28 deg | 10.2 MB | 2.2 MB |
+| Synthetic Blender-axis A-pose | about 0.04 s | 0.00 deg | 464 KB | 267 KB |
+
+A real VRoid VRM (109 bones, 22 mapped by the synonym table) also exports with 0 validator errors; it is not committed because of its size and license. To include your own rigs, drop `.glb`, `.fbx` or `.vrm` files in `tests/fixtures-local/` (git-ignored) and they join the matrix.
+
+Meshopt numbers depend on the texture content: the VRM above goes from 129 MB raw to 5 MB.
+
+## Honest limitations
+
+- No foot-lock or IK yet. Proportion differences cause foot slide on very short or long legged targets; two-bone IK foot-lock is the known next step.
+- Swing-only alignment fixes direction but not roll. Rigs whose rest roll differs from the BVH can twist forearms; a roll-match step or per-bone offset would cover it.
+- Bones the BVH has no counterpart for (for example a Mixamo `Spine2` against a BVH without it) hold their rest pose relative to their parent; the chain direction is still aligned through them.
+- FBXLoader is the least predictable stage (twin bones, units, external textures). GLB input is cleaner and recommended.
+- Large textured characters are texture-bound on export. Use `--max-tex 1024` on phones.
+- The compressed GLB requires `EXT_meshopt_compression` and `KHR_mesh_quantization`. three.js, Babylon.js and model-viewer load it; other glTF viewers may not. Every optimized bake therefore also offers a **universal GLB** (plain glTF 2.0, no required extensions).
+- **macOS Preview and Quick Look cannot open GLB at all** (ModelIO has no glTF importer), compressed or not. Use **Download USDZ** (or the `usdz` command): a skinned, animated UsdSkel file that Apple's own ModelIO/SceneKit loads, checked in the test suite on macOS. Textures are limited to base color; multi-material meshes use face subsets; unskinned meshes are skipped; files are large because USDZ stores plain text (about 22 MB for 33 s at 30 fps), so trim or lower `--fps` for sharing.
+- Rig breadth: tested on Mixamo, one VRoid VRM and synthetic A-pose / Blender-axis rigs. Untested on real Blender, Ready Player Me exports, twist/roll bones and non-humanoids.
+- Mesquite's BVH frame-time bug (declares 1/30 s but samples every 25 ms) is a Mesquite-side fix; a BVH with a wrong frame time will play too slow or fast here too.
+
+## Layout
+
+```
+docs/                  the static PWA (GitHub Pages root)
+  js/mocap-bake.mjs    deterministic engine (stages 2 to 6)
+  js/loaders.js        stage 1       js/pipeline.js   stage 7, shared by GUI and tests
+  js/command.js        raw command grammar, presets, examples
+  js/live.js           stream recorder + resampler   js/ai.js   optional assist + host validator
+  vendor/              three.js and the meshopt optimizer, built by scripts/vendor.mjs
+scripts/vendor.mjs     copies and minifies the vendored dependencies
+tests/                 unit tests, Playwright matrix, verifier, fixtures, golden frames
+```
+
+Fixtures: Mixamo X Bot and Y Bot, and a 33 s motion capture clip downsampled to 30 fps.
+
+## License
+
+GPL-3.0-only. See [LICENSE](LICENSE).

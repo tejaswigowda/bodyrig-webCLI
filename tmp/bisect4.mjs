@@ -1,0 +1,33 @@
+import { chromium } from 'playwright';
+import { createServer } from '../server.js';
+import fs from 'node:fs';
+const srv = createServer('docs', {'/fixtures/': 'tests/fixtures'});
+await new Promise(r => srv.listen(0, '127.0.0.1', r));
+const origin = `http://127.0.0.1:${srv.address().port}`;
+const b = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const p = await (await b.newContext({ serviceWorkers: 'block' })).newPage();
+p.on('pageerror', e => console.log('pageerror:', e.stack));
+await p.goto(origin + '/index.html?nosw');
+await p.waitForFunction('window.rigWebCLI?.ready');
+await p.evaluate(() => window.rigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake --trim 0:2 --fps 15 --no-optimize'));
+const out = await p.evaluate(async () => {
+  const THREE = await import('three');
+  const { GLTFExporter } = await import('three/addons/exporters/GLTFExporter.js');
+  const s = window.rigWebCLI.state, model = s.model, clip = s.last.clip;
+  const exp = async (roots, anims = []) => window.rigWebCLI.b64(await new GLTFExporter().parseAsync(roots, { binary: true, animations: anims, onlyVisible: true, trs: true }));
+  const toStd = m => { const n = new THREE.MeshStandardMaterial({ color: m.color?.clone() ?? 0xcccccc, roughness: 0.8, metalness: 0 }); n.name = m.name; return n; };
+  model.traverse(o => { if (o.isMesh) o.material = toStd([].concat(o.material)[0]); });
+  s.rig.poseAll();
+  const skinned = []; model.traverse(o => { if (o.isSkinnedMesh) skinned.push(o); });
+  const only = async (keep, anims = []) => { skinned.forEach(m => m.visible = m === keep); const r = await exp(model, anims); skinned.forEach(m => m.visible = true); return r; };
+  const res = {};
+  res.N1_joints_mesh_only = await only(skinned[0]);
+  res.N2_surface_mesh_only = await only(skinned[1]);
+  const saved = skinned.map(m => [m.geometry.attributes.normal, m.geometry.attributes.uv]);
+  skinned.forEach(m => { m.geometry.deleteAttribute('normal'); m.geometry.deleteAttribute('uv'); });
+  res.O_both_meshes_position_only = await exp(model);
+  return res;
+});
+fs.mkdirSync('tests/out/preview-bisect', { recursive: true });
+for (const [k, v] of Object.entries(out)) { fs.writeFileSync(`tests/out/preview-bisect/${k}.glb`, Buffer.from(v, 'base64')); console.log(k, Math.round(v.length * 0.75 / 1024), 'KB'); }
+await b.close(); srv.close();
