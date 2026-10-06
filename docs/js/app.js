@@ -120,11 +120,11 @@ function removeMotionFile(file) {
 }
 
 function addBvhText(name, text) {
-  const { source, ms } = loadMotion(text);
+  const { bvh, source, ms } = loadMotion(text);
   state.motions = state.motions.filter(m => m.file !== name);
   state.motions.push({ file: name, name: baseName(name), source, text, ms, info: describeSource(source, source.clip.duration) });
   state.last = null;
-  log(`loaded ${name}: ${source.bones.length} joints, ${source.clip.duration.toFixed(2)} s`, 'dim');
+  log(`loaded ${name}: ${source.bones.length} joints, ${source.clip.duration.toFixed(2)} s${bvh.absoluteRootPosition ? '; root positions are absolute (OFFSET not added)' : ''}`, 'dim');
 }
 
 async function addAnimationFile(name, buf) {

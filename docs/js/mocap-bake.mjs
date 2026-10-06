@@ -42,6 +42,16 @@ export function parseBVH(text) {
   const bvh = new BVHLoader().parse(text);
   bvh.skeleton.bones.forEach(b => { b.name = stripNs(b.name); });
   bvh.clip.tracks.forEach(t => { t.name = stripNs(t.name); });
+  // BVHLoader adds the root OFFSET to the position channels. Some exporters (Mesquite, Motive) write absolute positions
+  // that already equal the OFFSET on frame 0, which doubles the root height and flings the character off the floor.
+  const root = bvh.skeleton.bones[0], track = bvh.clip.tracks.find(t => t.name === `${root.name}.position`);
+  if (track) {
+    const o = root.position, v = track.values;
+    if (o.length() > 1e-3 && Math.hypot(v[0] - 2 * o.x, v[1] - 2 * o.y, v[2] - 2 * o.z) < 0.1 * o.length()) {
+      for (let i = 0; i < v.length; i += 3) { v[i] -= o.x; v[i + 1] -= o.y; v[i + 2] -= o.z; }
+      bvh.absoluteRootPosition = true;
+    }
+  }
   return bvh;
 }
 

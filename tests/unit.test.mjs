@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, formatCommand, parseTrim, DEFAULTS, PRESETS, EXAMPLES } from '../docs/js/command.js';
 import { parseChannels, parseFrameMessage, resample, buildBVH, LiveRecorder } from '../docs/js/live.js';
-import { canonical, CORE_BONES } from '../docs/js/mocap-bake.mjs';
+import { canonical, CORE_BONES, parseBVH } from '../docs/js/mocap-bake.mjs';
 import { validateLabels, describeBones } from '../docs/js/ai.js';
 import { explainReport } from '../docs/js/advice.js';
 import { isMapJSON, classify } from '../docs/js/loaders.js';
@@ -70,6 +70,16 @@ test('live: recorder validates frames and builds a BVH', () => {
   assert.ok(!bvh.includes('Frames: 3'));
   assert.equal(parseFrameMessage('', 0), null);
   assert.equal(buildBVH(header, [[0, 0, 0, 0, 0, 0]], 30).split('\n').at(-2), '0 0 0 0 0 0');
+});
+
+test('bvh: root OFFSET is added to the channels unless they are already absolute', () => {
+  const bvh = (offset, frame) => `HIERARCHY\nROOT Hips\n{\n OFFSET ${offset}\n CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n JOINT Spine\n {\n  OFFSET 0 10 0\n  CHANNELS 3 Zrotation Xrotation Yrotation\n  End Site\n  {\n   OFFSET 0 5 0\n  }\n }\n}\nMOTION\nFrames: 2\nFrame Time: 0.1\n${frame} 0 0 0 0 0 0\n${frame} 0 0 0 0 0 0\n`;
+  const y0 = b => parseBVH(b).clip.tracks.find(t => t.name === 'Hips.position').values[1];
+  assert.equal(y0(bvh('0 99 0', '0 99 0')), 99, 'Mesquite style: channels equal the offset, so do not add it twice');
+  assert.equal(parseBVH(bvh('0 99 0', '0 99 0')).absoluteRootPosition, true);
+  assert.equal(y0(bvh('0 0 0', '0 99 0')), 99, 'zero offset');
+  assert.equal(y0(bvh('0 10 0', '0 0 0')), 10, 'channels relative to the offset keep the standard additive meaning');
+  assert.equal(parseBVH(bvh('0 10 0', '0 0 0')).absoluteRootPosition, undefined);
 });
 
 test('upload roles: FBX / GLB are a character or an animation depending on the zone', () => {
