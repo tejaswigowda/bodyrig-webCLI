@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#0d0f1a">
-  <meta name="description" content="Retarget BVH mocap onto any skinned character and export an animated, web-optimized GLB. 100% local: nothing leaves your browser.">
+  <meta name="description" content="Retarget BVH, FBX and GLB animations onto any skinned character and export one animated, web-optimized GLB with every animation as its own track. 100% local: nothing leaves your browser.">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="rig webCLI">
@@ -29,7 +29,7 @@
 </header>
 
 <div class="container">
-  <div class="statusbar"><span class="dot" id="dot"></span><span id="statusText">Drop a character and a BVH to begin.</span></div>
+  <div class="statusbar"><span class="dot" id="dot"></span><span id="statusText">Drop a character and at least one animation to begin.</span></div>
 
   <div class="layout">
     <!-- LEFT: inputs and the three levels of control -->
@@ -37,11 +37,18 @@
       <div class="card">
         <div class="card-header">1 &middot; Inputs</div>
         <div class="card-body">
-          <div class="drop-zone" id="drop" tabindex="0">
-            <strong>Drop files here or click to browse</strong>
-            <small>Character: FBX, GLB, glTF, VRM, Mesquite rig.json<br>Motion: BVH &middot; Optional: a saved bone map (.json)</small>
+          <div class="drops">
+            <div class="drop-zone" id="dropModel" tabindex="0">
+              <strong>Character</strong>
+              <small>FBX, GLB, glTF, VRM or Mesquite rig.json<br>Drop or click. One character.</small>
+            </div>
+            <div class="drop-zone" id="dropMotion" tabindex="0">
+              <strong>Animation tracks</strong>
+              <small>BVH, FBX or GLB<br>Drop or click. Add as many as you like; each becomes its own track.</small>
+            </div>
           </div>
-          <input type="file" id="fileInput" multiple hidden accept=".fbx,.glb,.gltf,.vrm,.json,.bvh">
+          <input type="file" id="modelInput" hidden accept=".fbx,.glb,.gltf,.vrm,.json">
+          <input type="file" id="motionInput" multiple hidden accept=".bvh,.fbx,.glb,.gltf">
           <div class="chips" id="chips"></div>
           <button class="btn btn-ghost btn-sm" id="btnSample">Try with the sample (X Bot + 33 s mocap)</button>
         </div>
@@ -117,6 +124,7 @@
         <div class="viewer-host" id="viewer"><div class="viewer-empty" id="viewerEmpty">Preview appears here</div></div>
         <div class="transport">
           <button class="btn btn-ghost btn-sm" id="btnPlay" disabled>Play</button>
+          <select id="trackSelect" class="track-select" aria-label="Animation track" hidden></select>
           <input type="range" id="scrub" min="0" max="1000" value="0" disabled>
           <span class="time" id="time">0.00 / 0.00 s</span>
         </div>
@@ -126,8 +134,8 @@
         <div class="card-header">Result</div>
         <div class="card-body">
           <div class="note" id="resultInfo"></div>
-          <div class="row"><button class="btn btn-success" id="btnDownload">Download GLB</button><button class="btn btn-ghost" id="btnDownloadRaw" hidden>Download universal GLB</button><button class="btn btn-ghost" id="btnDownloadUsdz">Download USDZ (macOS Preview)</button></div>
-          <div class="note" id="resultHint" hidden>The compressed GLB uses EXT_meshopt_compression and KHR_mesh_quantization: it loads in three.js, Babylon.js and model-viewer. The universal GLB is plain glTF 2.0 for other viewers. macOS Preview and Quick Look cannot open GLB at all; use the USDZ there.</div>
+          <div class="row"><button class="btn btn-success" id="btnDownload">Download GLB</button></div>
+          <div class="note" id="resultHint" hidden>Every animation track is embedded in the one GLB as its own named animation. A meshopt-compressed GLB (EXT_meshopt_compression, KHR_mesh_quantization) loads in three.js, Babylon.js and model-viewer; untick <b>Meshopt compress</b> for plain glTF 2.0.</div>
         </div>
       </div>
 
@@ -140,8 +148,9 @@
           <input type="file" id="mapInput" accept=".json" hidden>
         </span></div>
         <div class="card-body">
-          <div class="advice" id="advice"><span class="note">Load a character and a BVH to see how bones map.</span></div>
-          <div class="map-scroll" id="mapScroll" hidden><table class="map"><thead><tr><th>Character bone</th><th>Canonical</th><th>BVH bone</th></tr></thead><tbody id="mapBody"></tbody></table></div>
+          <label class="field" id="mapTrackField" hidden>Mapping shown for track<select id="mapTrack"></select></label>
+          <div class="advice" id="advice"><span class="note">Load a character and an animation to see how bones map.</span></div>
+          <div class="map-scroll" id="mapScroll" hidden><table class="map"><thead><tr><th>Character bone</th><th>Canonical</th><th>Source bone</th></tr></thead><tbody id="mapBody"></tbody></table></div>
         </div>
       </div>
 

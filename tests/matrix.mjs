@@ -3,7 +3,6 @@
 // plus zero-egress, offline (service worker) and live-stream checks.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { WebSocketServer } from 'ws';
@@ -18,7 +17,7 @@ const UPDATE = process.argv.includes('--update-golden');
 const MAX_MEAN_DEG = 3, MAX_P95_DEG = 8;
 fs.mkdirSync(outDir, { recursive: true }); fs.mkdirSync(goldenDir, { recursive: true });
 
-const server = createServer(path.join(root, 'docs'), { '/fixtures/': fixtures, '/local/': localFixtures });
+const server = createServer(path.join(root, 'docs'), { '/fixtures/': fixtures, '/local/': localFixtures, '/out/': outDir });
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const origin = `http://127.0.0.1:${server.address().port}`;
 
@@ -90,12 +89,14 @@ try {
   const uiErrors = []; ui.on('pageerror', e => uiErrors.push(e.message));
   await ui.setViewportSize({ width: 1400, height: 1000 });
   await ui.goto(`${origin}/index.html?nosw`);
-  await ui.setInputFiles('#fileInput', [path.join(fixtures, 'ybot.fbx'), path.join(fixtures, BVH)]);
+  await ui.setInputFiles('#modelInput', [path.join(fixtures, 'ybot.fbx')]);
+  await ui.waitForFunction(() => window.rigWebCLI.state.model);
+  check(!(await ui.locator('#resultCard').isVisible()), 'ui: baked before any animation track was added');
+  await ui.setInputFiles('#motionInput', [path.join(fixtures, BVH)]);
   await ui.waitForSelector('#resultCard:not([hidden])', { timeout: 60000 });
   check((await ui.locator('#mapBody tr').count()) > 10, 'ui: mapping table did not render');
-  check(await ui.locator('#btnDownloadRaw').isVisible(), 'ui: universal GLB button missing after an optimized bake');
-  const needs = await ui.evaluate(() => { const u = new Uint8Array(window.rigWebCLI.state.last.raw); const n = new DataView(u.buffer).getUint32(12, true); return JSON.parse(new TextDecoder().decode(u.subarray(20, 20 + n))).extensionsRequired ?? []; });
-  check(!needs.length, `ui: universal GLB requires extensions: ${needs}`);
+  check((await ui.locator('#btnDownloadRaw, #btnDownloadUsdz').count()) === 0, 'ui: universal GLB / USDZ buttons should be gone');
+  check(await ui.locator('#trackSelect').isHidden(), 'ui: track selector shown for a single track');
   check((await ui.locator('.stage:not(.skipped)').count()) === 7, 'ui: not all seven stages reported');
   // playback: the pose must change with the scrubber and advance on its own
   const pose = () => ui.evaluate(() => { let q; window.rigWebCLI.state.model.traverse(o => { if (o.isBone && /LeftUpLeg$/.test(o.name)) q = o.quaternion.toArray().map(x => +x.toFixed(4)).join(); }); return q; });
@@ -125,26 +126,60 @@ try {
   await ui.screenshot({ path: path.join(outDir, 'ui.png') });
   const [dl] = await Promise.all([ui.waitForEvent('download', { timeout: 15000 }).catch(() => null), ui.click('#btnDownload')]);
   if (dl) check(fs.statSync(await dl.path()).size > 1000, 'ui: downloaded GLB is empty');
+  // a second animation track (a GLB baked earlier in this run) is embedded next to the BVH track
+  await ui.setInputFiles('#motionInput', [path.join(outDir, 'xbot.trim-inplace-24fps.glb')]);
+  await ui.waitForSelector('#trackSelect:not([hidden])', { timeout: 60000 });
+  check((await ui.locator('#trackSelect option').count()) === 2, 'ui: track selector should list both tracks');
+  check((await ui.locator('.chip:has(.kind:text("track"))').count()) === 2, 'ui: expected two track chips');
+  check(await ui.locator('#mapTrackField').isVisible(), 'ui: mapping track selector missing with two tracks');
+  check(/2 tracks/.test(await ui.locator('#resultInfo').innerText()), 'ui: result does not report two tracks');
+  await ui.selectOption('#trackSelect', '1');
+  check(await ui.evaluate(() => document.getElementById('time').textContent.includes('/ 8.00')), 'ui: switching track did not load the 8 s clip');
+  await ui.locator('.chip:has-text("xbot.trim-inplace-24fps") .rm').click();
+  check((await ui.locator('.chip:has(.kind:text("track"))').count()) === 1, 'ui: removing a track chip did not remove the track');
   check(!uiErrors.length, `ui: page errors: ${uiErrors.slice(0, 2).join(' | ')}`);
   await ui.close();
 } catch (e) { failures.push(`ui: ${e.message}`); }
 
-// ---- USDZ for macOS Preview (which cannot open GLB): structure everywhere, Apple's own loader on macOS ----
+// ---- several animation tracks (BVH + a GLB animation) embedded as separate animations in one GLB ----
 try {
-  const r = await page.evaluate(async () => { await window.rigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake --trim 0:4 --fps 15 --no-optimize'); return window.rigWebCLI.usdz(); });
-  const usdz = Buffer.from(r.b64, 'base64'); fs.writeFileSync(path.join(outDir, 'xbot.usdz'), usdz);
-  const nameLen = usdz.readUInt16LE(26), extraLen = usdz.readUInt16LE(28);
-  check(usdz.subarray(30, 30 + nameLen).toString() === 'model.usda', 'usdz: model.usda must be the first entry');
-  check((30 + nameLen + extraLen) % 64 === 0, 'usdz: first entry is not 64-byte aligned');
-  check(usdz.readUInt16LE(8) === 0, 'usdz: entries must be stored, not compressed');
-  if (process.platform === 'darwin') {
-    const bin = path.join(outDir, 'usdz-check');
-    execFileSync('swiftc', [path.join(root, 'tests', 'usdz-check.swift'), '-o', bin], { stdio: 'pipe' });
-    const info = JSON.parse(execFileSync(bin, [path.join(outDir, 'xbot.usdz')], { stdio: ['ignore', 'pipe', 'ignore'] }).toString());
-    check(info.meshes >= 1 && info.joints === r.joints && info.skinners >= 1 && info.animations >= 1, `usdz: Apple loader saw ${JSON.stringify(info)}`);
-    console.log(`usdz: ModelIO/SceneKit loaded ${JSON.stringify(info)}`);
-  } else console.log('usdz: structure checked (Apple loader check runs on macOS only)');
-} catch (e) { failures.push(`usdz: ${e.message}`); }
+  const r = await page.evaluate(() => window.rigWebCLI.bakeUrls('/fixtures/ybot.fbx', ['/fixtures/mocap-33s.bvh', '/out/xbot.trim-inplace-24fps.glb'], 'bake --no-optimize --trim 0:4 --fps 15'));
+  const glb = Buffer.from(r.b64, 'base64'); fs.writeFileSync(path.join(outDir, 'ybot.multitrack.glb'), glb);
+  check(JSON.stringify(r.tracks) === JSON.stringify(['mocap-33s', 'xbot.trim-inplace-24fps']), `tracks: unexpected names ${r.tracks}`);
+  const v0 = await verifyGLB(glb, bvhText, { clipIndex: 0 });
+  const v1 = await verifyGLB(glb, bvhText, { clipIndex: 1, offset: 2 }); // the GLB track is BVH seconds 2..10, retargeted twice
+  check(v0.validator.errors === 0, `tracks: validator errors: ${v0.validator.top.join(' | ')}`);
+  check(v0.animations.length === 2 && v0.animations[0].name === 'mocap-33s' && v0.animations[1].name === 'xbot.trim-inplace-24fps', `tracks: GLB animations ${JSON.stringify(v0.animations)}`);
+  check(v0.animations.every(a => a.duration > 3.9 && a.tracks > 40), 'tracks: an embedded animation is short or nearly empty');
+  check(v0.meanLimbErrorDeg <= MAX_MEAN_DEG, `tracks: BVH track limb error ${v0.meanLimbErrorDeg}`);
+  check(Object.keys(v1.limb).length >= 6 && v1.meanLimbErrorDeg <= MAX_MEAN_DEG, `tracks: GLB-source track limb error ${v1.meanLimbErrorDeg} (${Object.keys(v1.limb).length} segments)`);
+  // asking for one file by name embeds only that file's track(s)
+  const one = await page.evaluate(() => window.rigWebCLI.execute('bake ybot.fbx xbot.trim-inplace-24fps.glb --no-optimize').then(x => x.clips.map(c => c.name)));
+  check(JSON.stringify(one) === JSON.stringify(['xbot.trim-inplace-24fps']), `tracks: named motion selected ${one}`);
+  console.log(`tracks: ${r.tracks.join(' + ')} -> ${v0.animations.length} animations, limb error ${v0.meanLimbErrorDeg} / ${v1.meanLimbErrorDeg} deg`);
+} catch (e) { failures.push(`tracks: ${e.message}`); }
+
+// ---- export fidelity: FBX-style "transparent at opacity 1" materials must not export as BLEND ----
+try {
+  const r = await page.evaluate(async () => {
+    const THREE = await import('/vendor/three/three.module.js');
+    const { settleAlphaModes } = await import('/js/pipeline.js');
+    const cv = fn => { const c = document.createElement('canvas'); c.width = c.height = 64; fn(c.getContext('2d')); return new THREE.CanvasTexture(c); };
+    const white = () => cv(g => { g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 64); });
+    const half = () => cv(g => { g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 64); g.fillStyle = '#000'; g.fillRect(0, 0, 32, 64); });
+    const mk = o => new THREE.MeshStandardMaterial({ transparent: true, ...o });
+    const mats = { opaque: mk({ map: white(), alphaMap: white() }), cutout: mk({ map: white(), alphaMap: half() }), glass: mk({ opacity: 0.5 }), plain: mk({}) };
+    const g = new THREE.Group(); for (const m of Object.values(mats)) g.add(new THREE.Mesh(new THREE.BufferGeometry(), m));
+    const snap = () => Object.fromEntries(Object.entries(mats).map(([k, m]) => [k, { t: m.transparent, a: m.alphaTest, am: !!m.alphaMap }]));
+    const s = settleAlphaModes(g), during = snap(); s.restore();
+    return { during, after: snap() };
+  });
+  check(!r.during.opaque.t && r.during.opaque.a === 0, `alpha: an opaque alpha map should export OPAQUE, got ${JSON.stringify(r.during.opaque)}`);
+  check(!r.during.cutout.t && r.during.cutout.a === 0.5 && !r.during.cutout.am, `alpha: a cutout alpha map should export MASK with the map folded in, got ${JSON.stringify(r.during.cutout)}`);
+  check(r.during.glass.t, 'alpha: real translucency (opacity 0.5) must stay BLEND');
+  check(!r.during.plain.t, 'alpha: a textureless opacity-1 material should export OPAQUE');
+  check(r.after.opaque.t && r.after.cutout.t && r.after.cutout.am && r.after.cutout.a === 0, 'alpha: live materials were not restored after export');
+} catch (e) { failures.push(`alpha: ${e.message}`); }
 
 // ---- live stream: mock device -> record -> resample -> bake -> verify ----
 try {
@@ -161,14 +196,14 @@ try {
   const live = await ctx.newPage();
   await live.goto(`${origin}/index.html?nosw`);
   await live.waitForFunction('window.rigWebCLI?.ready === true');
-  await live.setInputFiles('#fileInput', [path.join(fixtures, 'xbot.fbx')]);
+  await live.setInputFiles('#modelInput', [path.join(fixtures, 'xbot.fbx')]);
   await live.waitForFunction(() => window.rigWebCLI.state.model);
   await live.locator('details:has(#liveUrl) > summary').click();
   await live.fill('#liveUrl', `ws://127.0.0.1:${wss.address().port}`);
   await live.click('#btnLiveConnect');
   await live.waitForFunction(() => /Recording: (\d+) frames/.test(document.getElementById('liveStatus').textContent) && +document.getElementById('liveStatus').textContent.match(/(\d+) frames/)[1] >= 80, null, { timeout: 20000 });
   await live.click('#btnLiveStop'); await live.click('#btnLiveUse');
-  const r = await live.evaluate(async () => { const x = await window.rigWebCLI.execute('bake --no-optimize'); const s = window.rigWebCLI.state; return { b64: window.rigWebCLI.b64(x.glb), bvh: s.bvhText, frames: x.report.frames }; });
+  const r = await live.evaluate(async () => { const x = await window.rigWebCLI.execute('bake --no-optimize'); const s = window.rigWebCLI.state; return { b64: window.rigWebCLI.b64(x.glb), bvh: s.motions[0].text, frames: x.report.frames }; });
   const ver = await verifyGLB(Buffer.from(r.b64, 'base64'), r.bvh);
   check(ver.validator.errors === 0, 'live: validator errors');
   check(r.frames > 40, `live: only ${r.frames} frames baked`);

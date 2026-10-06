@@ -1,13 +1,12 @@
 // command.js -- the raw control surface. Pure functions (no DOM) so the GUI, the terminal box and tests share one grammar.
-//   bake [model] [motion] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--map FILE]
+//   bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--map FILE]
 //        [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--out NAME]
 //   map  [--map FILE]        auto-map and print the mapping table
 //   inspect                  print the stage-by-stage report of the last bake
-//   usdz [--out NAME]        export the last bake as skinned, animated USDZ (macOS Preview / Quick Look)
 //   help | clear
 
 export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, mapFile: null, optimize: true, level: 'medium', maxTex: 0, out: null };
-export const COMMANDS = ['bake', 'map', 'inspect', 'usdz', 'help', 'clear'];
+export const COMMANDS = ['bake', 'map', 'inspect', 'help', 'clear'];
 const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'level', 'max-tex', 'out']);
 const BOOL_FLAGS = new Set(['in-place', 'loop', 'no-align', 'optimize', 'no-optimize']);
 
@@ -67,11 +66,11 @@ export function parseCommand(line) {
 
 const q = s => (/\s/.test(s) ? `"${s}"` : s);
 
-export function formatCommand(opts, { model, motion } = {}) {
+export function formatCommand(opts, { model, motions = [] } = {}) {
   const o = { ...DEFAULTS, ...opts };
   const parts = ['bake'];
   if (model) parts.push(q(model));
-  if (motion) parts.push(q(motion));
+  for (const m of motions) parts.push(q(m));
   if (o.fps !== DEFAULTS.fps) parts.push('--fps', o.fps);
   if (o.trim) parts.push('--trim', `${o.trim[0] || ''}:${o.trim[1] ?? ''}`);
   if (o.inPlace) parts.push('--in-place');
@@ -94,7 +93,8 @@ export const PRESETS = [
 ];
 
 export const EXAMPLES = [
-  { cmd: 'bake', note: 'Retarget the whole clip at 30 fps and export an optimized GLB.' },
+  { cmd: 'bake', note: 'Retarget every loaded motion at 30 fps; each becomes its own animation track in one GLB.' },
+  { cmd: 'bake character.glb walk.bvh run.fbx', note: 'Name the character and only the motion files to embed.' },
   { cmd: 'bake --trim 2:10', note: 'Keep seconds 2 to 10 only.' },
   { cmd: 'bake --trim :5 --fps 60', note: 'First 5 seconds at 60 fps.' },
   { cmd: 'bake --in-place --loop --trim 2:6', note: 'Idle/walk-in-place cycle from a 4 second window.' },
@@ -107,10 +107,9 @@ export const EXAMPLES = [
 ];
 
 export const HELP = `Commands
-  bake [model] [motion] [flags]   retarget and export a GLB
+  bake [model] [motion ...] [flags]   retarget every motion (BVH, FBX, GLB) onto the model; one animation track each
   map  [--map FILE]               auto-map bones, print the table
   inspect                         stage-by-stage report of the last bake
-  usdz [--out NAME]               export the last bake as USDZ (macOS Preview / Quick Look)
   clear                           clear this log
 
 Flags for bake

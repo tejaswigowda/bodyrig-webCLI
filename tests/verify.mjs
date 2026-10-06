@@ -38,7 +38,7 @@ export async function loadGLB(buf) {
   return new Promise((res, rej) => new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).parse(ab, '', res, rej));
 }
 
-export async function verifyGLB(glb, bvhText, { step = 0.5, offset = 0 } = {}) {
+export async function verifyGLB(glb, bvhText, { step = 0.5, offset = 0, clipIndex = 0 } = {}) {
   const u8 = new Uint8Array(glb);
   const jsonLen = new DataView(u8.buffer, u8.byteOffset).getUint32(12, true);
   const meshopt = (JSON.parse(new TextDecoder().decode(u8.subarray(20, 20 + jsonLen))).extensionsUsed ?? []).includes('EXT_meshopt_compression');
@@ -48,7 +48,7 @@ export async function verifyGLB(glb, bvhText, { step = 0.5, offset = 0 } = {}) {
   bvh.skeleton.bones.forEach(b => { b.name = b.name.replace(/^.*:/, ''); });
   bvh.clip.tracks.forEach(t => { t.name = t.name.replace(/^.*:/, ''); });
   const srcRoot = new THREE.Group(); srcRoot.add(bvh.skeleton.bones[0]);
-  const clip = gltf.animations[0];
+  const clip = gltf.animations[clipIndex];
   const srcMixer = new THREE.AnimationMixer(srcRoot); srcMixer.clipAction(bvh.clip).play();
   const tgtMixer = new THREE.AnimationMixer(gltf.scene); tgtMixer.clipAction(clip).play();
   const S = byCanon(srcRoot), T = byCanon(gltf.scene);
@@ -76,6 +76,7 @@ export async function verifyGLB(glb, bvhText, { step = 0.5, offset = 0 } = {}) {
   return {
     validator: { errors: report.issues.numErrors, warnings: report.issues.numWarnings, top: report.issues.messages.filter(m => m.severity <= 1).slice(0, 5).map(m => `${m.code}: ${m.message}`) },
     animation: { name: clip.name, duration: +clip.duration.toFixed(3), tracks: clip.tracks.length },
+    animations: gltf.animations.map(a => ({ name: a.name, duration: +a.duration.toFixed(3), tracks: a.tracks.length })),
     skins: gltf.parser.json.skins?.length ?? 0, limb, meanLimbErrorDeg: +allMean.toFixed(2), golden,
     meshopt,
   };

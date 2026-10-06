@@ -5,7 +5,7 @@ import { parseChannels, parseFrameMessage, resample, buildBVH, LiveRecorder } fr
 import { canonical, CORE_BONES } from '../docs/js/mocap-bake.mjs';
 import { validateLabels, describeBones } from '../docs/js/ai.js';
 import { explainReport } from '../docs/js/advice.js';
-import { isMapJSON } from '../docs/js/loaders.js';
+import { isMapJSON, classify } from '../docs/js/loaders.js';
 import { buildSyntheticRig } from './synthetic-rig.mjs';
 
 test('command: defaults and flags', () => {
@@ -25,6 +25,9 @@ test('command: format round-trips through parse', () => {
 
 test('command: positional files and errors', () => {
   assert.deepEqual(parseCommand('bake a.fbx b.bvh').positional, ['a.fbx', 'b.bvh']);
+  assert.deepEqual(parseCommand('bake a.glb walk.bvh "run fast.fbx" idle.glb --fps 24').positional, ['a.glb', 'walk.bvh', 'run fast.fbx', 'idle.glb']);
+  assert.equal(formatCommand({}, { model: 'a.glb', motions: ['walk.bvh', 'run fast.fbx'] }), 'bake a.glb walk.bvh "run fast.fbx"');
+  assert.throws(() => parseCommand('usdz'), /Unknown command/);
   assert.throws(() => parseCommand('bake --fps'), /needs a value/);
   assert.throws(() => parseCommand('bake --fps 0'), /between 1 and 240/);
   assert.throws(() => parseCommand('bake --trim 10:2'), /greater than start/);
@@ -67,6 +70,17 @@ test('live: recorder validates frames and builds a BVH', () => {
   assert.ok(!bvh.includes('Frames: 3'));
   assert.equal(parseFrameMessage('', 0), null);
   assert.equal(buildBVH(header, [[0, 0, 0, 0, 0, 0]], 30).split('\n').at(-2), '0 0 0 0 0 0');
+});
+
+test('upload roles: FBX / GLB are a character or an animation depending on the zone', () => {
+  assert.equal(classify('x.glb'), 'model');
+  assert.equal(classify('x.glb', 'model'), 'model');
+  assert.equal(classify('x.glb', 'motion'), 'motion');
+  assert.equal(classify('x.fbx', 'motion'), 'motion');
+  assert.equal(classify('x.bvh'), 'motion');
+  assert.equal(classify('x.bvh', 'model'), 'motion');
+  assert.equal(classify('x.json', 'motion'), 'json');
+  assert.equal(classify('x.obj'), null);
 });
 
 test('map json detection', () => {

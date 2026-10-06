@@ -34,12 +34,69 @@ async function optimizeOffThread(glb, level) {
   }
 }
 
-export async function exportGLB(model, clip, { optimize = true, level = 'medium', maxTex = 0 } = {}) {
+// FBXLoader marks every material transparent even at opacity 1, and keeps opacity in a separate alphaMap. glTF has
+// neither: it exports BLEND (no depth write in Blender and most engines, so eyes, teeth and the body under clothes
+// show through the skin) and drops the alphaMap (hair and lashes lose their cutouts). So each material is settled to
+// OPAQUE, MASK (cutout) or BLEND, with any alphaMap folded into the base-colour texture's alpha.
+function pixels(img, w, h) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(img, 0, 0, w, h);
+  return { c, g, data: g.getImageData(0, 0, w, h) };
+}
+
+function alphaProfile(m) { // alpha comes from the alphaMap's green channel, else from the colour texture's own alpha
+  const img = m.alphaMap?.image ?? m.map?.image, ch = m.alphaMap ? 1 : 3;
+  const w = img?.width, h = img?.height; if (!w || !h) return img ? null : { lo: 0, mid: 0, pixels: 1 }; // no texture: nothing translucent
+  try {
+    const s = Math.min(1, 256 / Math.max(w, h)), d = pixels(img, Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))).data.data;
+    let lo = 0, mid = 0;
+    for (let i = ch; i < d.length; i += 4) if (d[i] < 250) { lo++; if (d[i] > 20 && d[i] < 235) mid++; }
+    return { lo, mid, pixels: d.length / 4 };
+  } catch { return null; }
+}
+
+function foldAlphaMap(m) { // new texture = colour map with the alphaMap in its alpha channel; the original is untouched
+  const mi = m.map?.image, ai = m.alphaMap.image;
+  const w = mi?.width ?? ai.width, h = mi?.height ?? ai.height;
+  const a = pixels(ai, w, h).data.data;
+  let col; if (mi) col = pixels(mi, w, h); else { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, w, h); col = { c, g, data: g.getImageData(0, 0, w, h) }; }
+  for (let i = 3; i < col.data.data.length; i += 4) col.data.data[i] = a[i - 2];
+  col.g.putImageData(col.data, 0, 0);
+  const src = m.map ?? m.alphaMap, t = new src.constructor(col.c);
+  for (const k of ['colorSpace', 'flipY', 'wrapS', 'wrapT', 'minFilter', 'magFilter', 'anisotropy', 'channel', 'rotation', 'name']) t[k] = src[k];
+  t.offset.copy(src.offset); t.repeat.copy(src.repeat); t.center.copy(src.center);
+  if (!m.map) t.colorSpace = 'srgb';
+  t.needsUpdate = true;
+  return t;
+}
+
+export function settleAlphaModes(model) {
+  const seen = new Set(), saved = [], modes = { opaque: 0, mask: 0, blend: 0 };
+  model.traverse(o => {
+    for (const m of [].concat(o.material || [])) {
+      if (seen.has(m)) continue; seen.add(m);
+      if (!m.transparent || m.opacity < 0.999) { if (m.transparent) modes.blend++; continue; }
+      const p = alphaProfile(m);
+      if (!p) { modes.blend++; continue; }
+      saved.push([m, m.transparent, m.alphaTest, m.map, m.alphaMap]);
+      if (p.lo < p.pixels * 0.001) { m.transparent = false; m.alphaMap = null; modes.opaque++; continue; }
+      if (m.alphaMap) { m.map = foldAlphaMap(m); m.alphaMap = null; }
+      // BLEND only for alpha that is soft over much of the texture (glass, smoke); hair and clothing atlases are cutouts
+      if (p.mid < p.pixels * 0.4) { m.transparent = false; m.alphaTest = 0.5; modes.mask++; } else modes.blend++;
+    }
+  });
+  return { modes, restore: () => { for (const [m, t, a, map, am] of saved) { if (m.map && m.map !== map) m.map.dispose(); m.transparent = t; m.alphaTest = a; m.map = map; m.alphaMap = am; m.needsUpdate = true; } } };
+}
+
+export async function exportGLB(model, clips, { optimize = true, level = 'medium', maxTex = 0 } = {}) {
   const stages = [];
   let t = performance.now();
   const downscaled = maxTex ? downscaleTextures(model, maxTex) : 0;
-  const raw = await new GLTFExporter().parseAsync(model, { binary: true, animations: [clip], onlyVisible: false });
-  stages.push({ n: 7, name: 'export GLB', ms: Math.round(performance.now() - t), info: { kb: Math.round(raw.byteLength / 1024), downscaledTextures: downscaled } });
+  const alpha = settleAlphaModes(model);
+  let raw;
+  try { raw = await new GLTFExporter().parseAsync(model, { binary: true, animations: [].concat(clips), onlyVisible: false }); }
+  finally { alpha.restore(); }
+  stages.push({ n: 7, name: 'export GLB', ms: Math.round(performance.now() - t), info: { kb: Math.round(raw.byteLength / 1024), animations: [].concat(clips).length, downscaledTextures: downscaled, alphaModes: alpha.modes } });
   if (!optimize) return { glb: raw, raw, rawBytes: raw.byteLength, stages };
   t = performance.now();
   const glb = await optimizeOffThread(raw, level);
@@ -47,12 +104,21 @@ export async function exportGLB(model, clip, { optimize = true, level = 'medium'
   return { glb, raw, rawBytes: raw.byteLength, stages };
 }
 
-// map: canonical-name -> BVH bone name overrides (from the mapping panel or --map file).
-export async function runBake({ model, bvh, opts = {}, map = {} }) {
-  const { clip, report } = bakeMocap(model, bvh, { fps: opts.fps, trim: opts.trim, inPlace: opts.inPlace, loop: opts.loop, align: opts.align, map });
-  const exp = await exportGLB(model, clip, opts);
+// motions: [{ name, source }] -- every source is retargeted on its own and embedded as its own animation track.
+// map: canonical-name -> source bone name overrides (from the mapping panel or --map file), applied to every track.
+export async function runBake({ model, motions, opts = {}, map = {} }) {
+  const used = new Set();
+  const unique = n => { let u = n, i = 2; while (used.has(u)) u = `${n}_${i++}`; used.add(u); return u; };
+  const baked = motions.map(m => {
+    try { return bakeMocap(model, m.source, { fps: opts.fps, trim: opts.trim, inPlace: opts.inPlace, loop: opts.loop, align: opts.align, map, name: unique(m.name) }); }
+    catch (e) { throw motions.length > 1 ? new Error(`${m.name}: ${e.message}`) : e; }
+  });
+  const clips = baked.map(b => b.clip);
+  const report = { ...baked[0].report, tracks: baked.map(b => ({ name: b.clip.name, frames: b.report.frames, duration: b.report.duration, mapped: b.report.mapped, bones: b.report.bones })) };
+  if (baked.length > 1) report.stages = baked.flatMap(b => b.report.stages.map(s => ({ ...s, name: `${s.name} [${b.clip.name}]` }))).sort((a, b) => a.n - b.n);
+  const exp = await exportGLB(model, clips, opts);
   report.stages.push(...exp.stages);
-  return { clip, glb: exp.glb, raw: exp.raw, report, rawBytes: exp.rawBytes };
+  return { clips, clip: clips[0], glb: exp.glb, raw: exp.raw, report, rawBytes: exp.rawBytes };
 }
 
 export function bytesToBase64(buf) {

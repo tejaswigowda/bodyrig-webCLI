@@ -1,9 +1,9 @@
 // Offline-first: precache the app shell and every vendored dependency; everything is same-origin, so nothing third-party is ever cached or fetched.
-const CACHE = 'rig-webcli-v4';
+const CACHE = 'rig-webcli-v6';
 const SHELL = [
   './', './index.html', './style.css', './manifest.json', './icon.svg',
   './js/app.js', './js/viewer.js', './js/loaders.js', './js/pipeline.js', './js/command.js', './js/mocap-bake.mjs',
-  './js/live.js', './js/advice.js', './js/ai.js', './js/optimize-worker.js', './js/usdz.js',
+  './js/live.js', './js/advice.js', './js/ai.js', './js/optimize-worker.js',
   './vendor/gltf-optimize.js',
   './vendor/three/three.core.js', './vendor/three/three.module.js',
   './vendor/three/addons/loaders/FBXLoader.js', './vendor/three/addons/loaders/GLTFLoader.js', './vendor/three/addons/loaders/BVHLoader.js',

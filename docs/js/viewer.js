@@ -13,7 +13,7 @@ export function createViewer(host) {
   const sun = new THREE.DirectionalLight(0xffffff, 2.5); sun.position.set(3, 6, 4); scene.add(sun);
   const grid = new THREE.GridHelper(1, 20, 0x3a4060, 0x252a42); scene.add(grid);
 
-  let model = null, mixer = null, action = null, clip = null, follow = null, followSeen = false, playing = false, time = 0, speed = 1;
+  let model = null, mixer = null, action = null, clip = null, clips = [], follow = null, followSeen = false, playing = false, time = 0, speed = 1;
   const followLast = new THREE.Vector3(), listeners = new Set();
   let last = performance.now();
 
@@ -40,16 +40,21 @@ export function createViewer(host) {
 
   function setModel(m) {
     if (model) scene.remove(model);
-    model = m; mixer = action = clip = follow = null; time = 0; playing = false;
+    model = m; mixer = action = clip = follow = null; clips = []; time = 0; playing = false;
     scene.add(model); frame();
   }
 
-  function setClip(c, hipBone) {
-    clip = c;
+  function setClips(list, hipBone) {
+    clips = list; follow = hipBone ?? null;
     if (!mixer) mixer = new THREE.AnimationMixer(model);
+    selectClip(0);
+  }
+
+  function selectClip(i) {
+    clip = clips[i] ?? null;
     mixer.stopAllAction(); mixer.uncacheRoot(model);
-    action = mixer.clipAction(clip); action.play();
-    follow = hipBone ?? null; followSeen = false; time = 0; frame(); seek(0);
+    if (clip) { action = mixer.clipAction(clip); action.play(); }
+    followSeen = false; time = 0; frame(); seek(0);
   }
 
   function seek(t) {
@@ -77,7 +82,7 @@ export function createViewer(host) {
   tick();
 
   return {
-    setModel, setClip, seek, frame, canvas: renderer.domElement,
+    setModel, setClips, selectClip, seek, frame, canvas: renderer.domElement,
     play() { playing = !!clip; last = performance.now(); }, pause() { playing = false; },
     get playing() { return playing; }, get time() { return time; }, get duration() { return clip?.duration ?? 0; },
     setSpeed(s) { speed = s; },

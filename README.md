@@ -1,6 +1,6 @@
 # rig webCLI
 
-A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM or Mesquite `rig.json`) and a BVH motion, retarget the motion onto the character's **own skeleton**, and export an animated, web-optimized **GLB**.
+A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM or Mesquite `rig.json`) and any number of animations (BVH, FBX or GLB), retarget each onto the character's **own skeleton**, and export one animated, web-optimized **GLB** that carries every animation as its own track.
 <b><ins>No uploads, no servers: everything happens in your browser.</ins></b> Pure ES modules, no build step for the app (three.js and the optimizer are vendored in `docs/vendor`, so the whole app is same-origin and works offline).
 
 ## Paper
@@ -20,7 +20,18 @@ npm install     # dev tooling only (tests, vendoring); the app itself needs noth
 npm start       # http://127.0.0.1:8010 (any static host works; no COOP/COEP needed)
 ```
 
-Click **Try with the sample**, or drop a character and a BVH on the page. A bake starts as soon as both are loaded.
+Click **Try with the sample**, or drop a character into **Character** and one or more animations into **Animation tracks**. A bake starts as soon as there is a character and at least one track.
+
+## Animation tracks
+
+The two uploads are separate so the same file type can play either role:
+
+- **Character:** FBX, GLB, glTF, VRM or Mesquite `rig.json`. One at a time; a new drop replaces it.
+- **Animation tracks:** BVH, FBX or GLB. Add as many files as you like. Each BVH is one track; an FBX or GLB contributes one track per animation clip it carries (named `file_clip` when there are several). Remove a track with the × on its chip.
+
+Every track is retargeted independently with the same options and written to the GLB as its own named animation, so the exported file plays them one at a time (`mixer.clipAction(THREE.AnimationClip.findByName(gltf.animations, 'walk'))` in three.js). The preview has a track selector, and the mapping panel can show the bone table of any track. A saved bone map applies to every track; an entry naming a bone that a track does not have is ignored for that track.
+
+FBX and GLB animation files are read as a skeleton plus its clips, so they can be animation-only exports (for example Mixamo "without skin") or a full character file. FBX animation files are not covered by the test suite (no fixture with a clip); GLB animation sources are.
 
 ## The four Web-CLI properties
 
@@ -39,25 +50,25 @@ Retargeting is geometry with a right answer, so the core pipeline is 100% determ
 
 `docs/js/mocap-bake.mjs` is a reusable, dependency-light engine (only three.js). Stages 2 to 6 live there; stages 1 and 7 are in `loaders.js` and `pipeline.js`.
 
-1. **Load.** FBXLoader / GLTFLoader / ObjectLoader for the model, BVHLoader for motion. Textures are awaited so they can be re-encoded on export; textures that never resolve are dropped instead of failing the export.
+1. **Load.** FBXLoader / GLTFLoader / ObjectLoader for the model, BVHLoader for BVH motion, and FBXLoader / GLTFLoader again for FBX and GLB animation files. Textures are awaited so they can be re-encoded on export; textures that never resolve are dropped instead of failing the export.
 2. **Normalize rig.** Collapse FBX "twin" bones, rebind skins to one shared skeleton, put a common root at joint 0 (a glTF requirement).
 3. **Map bones.** Canonicalize names (`mixamorig`, `mm`, `Actor:` namespaces, VRoid `J_Bip_*`, UE and Rigify styles), resolve through a synonym table. Unmapped bones hold the rest pose.
 4. **Align reference pose.** Swing each mapped bone so its direction matches the BVH rest direction, across unmapped intermediate bones. This is what makes A-poses and non-Mixamo axes work, and what the naive local-quaternion copy cannot do.
 5. **Transfer rotations.** World-delta transfer with sign-continuous quaternions.
-6. **Root motion.** The BVH hip trajectory scaled by the leg-length ratio, so feet stay on the floor at any character size. `--in-place` drops horizontal travel.
-7. **Export + optimize.** GLTFExporter writes a binary GLB; glTF-Transform with meshopt compresses it, in a Web Worker.
+6. **Root motion.** The source hip trajectory (world space) scaled by the leg-length ratio, so feet stay on the floor at any character size. `--in-place` drops horizontal travel.
+7. **Export + optimize.** GLTFExporter writes a binary GLB with one animation per track; glTF-Transform with meshopt compresses it, in a Web Worker. Before export each material's alpha is settled to OPAQUE, MASK (cutout) or BLEND, with an FBX opacity map folded into the base-colour alpha: FBXLoader flags every material transparent, which glTF viewers such as Blender render without depth writes, so eyes, teeth and underlying layers showed through the skin. The live preview materials are restored afterwards.
 
 ## Command reference
 
 ```
-bake [model] [motion] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align]
+bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align]
      [--map FILE] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--out NAME]
 map  [--map FILE]     auto-map bones and print the table
 inspect               stage-by-stage report of the last bake
-usdz [--out NAME]     export the last bake as USDZ for macOS Preview / Quick Look
 help | clear
 ```
 
+- `bake` with no file names uses the loaded character and every loaded track. Name a character and some motion files (`bake hero.glb walk.bvh run.fbx`) to embed only those.
 - `--trim 2:10`, `2:` and `:10` are all valid (seconds).
 - `--loop` makes the last frame equal the first; root travel resets unless combined with `--in-place`.
 - `--map FILE` takes a flat `{ "Canonical": "BVH bone" }` JSON file. Drop it on the page, or use **Save map** in the mapping panel (it registers itself, and the command updates to include `--map`). An empty string pins a bone to its rest pose.
@@ -118,8 +129,8 @@ Meshopt numbers depend on the texture content: the VRM above goes from 129 MB ra
 - Bones the BVH has no counterpart for (for example a Mixamo `Spine2` against a BVH without it) hold their rest pose relative to their parent; the chain direction is still aligned through them.
 - FBXLoader is the least predictable stage (twin bones, units, external textures). GLB input is cleaner and recommended.
 - Large textured characters are texture-bound on export. Use `--max-tex 1024` on phones.
-- The compressed GLB requires `EXT_meshopt_compression` and `KHR_mesh_quantization`. three.js, Babylon.js and model-viewer load it; other glTF viewers may not. Every optimized bake therefore also offers a **universal GLB** (plain glTF 2.0, no required extensions).
-- **macOS Preview and Quick Look cannot open GLB at all** (ModelIO has no glTF importer), compressed or not. Use **Download USDZ** (or the `usdz` command): a skinned, animated UsdSkel file that Apple's own ModelIO/SceneKit loads, checked in the test suite on macOS. Textures are limited to base color; multi-material meshes use face subsets; unskinned meshes are skipped; files are large because USDZ stores plain text (about 22 MB for 33 s at 30 fps), so trim or lower `--fps` for sharing.
+- The meshopt-compressed GLB requires `EXT_meshopt_compression` and `KHR_mesh_quantization`. three.js, Babylon.js and model-viewer load it; other glTF viewers may not. Use `--no-optimize` (or untick **Meshopt compress**) for plain glTF 2.0 with no required extensions.
+- Skinned, animated GLBs from this tool have been reported not to open in macOS Preview / Quick Look, while static GLBs do; the cause is not identified yet.
 - Rig breadth: tested on Mixamo, one VRoid VRM and synthetic A-pose / Blender-axis rigs. Untested on real Blender, Ready Player Me exports, twist/roll bones and non-humanoids.
 - Mesquite's BVH frame-time bug (declares 1/30 s but samples every 25 ms) is a Mesquite-side fix; a BVH with a wrong frame time will play too slow or fast here too.
 

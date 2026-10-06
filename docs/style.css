@@ -53,6 +53,12 @@ details.card[open] > summary::after { content: '\25BE'; }
 .drop-zone:hover, .drop-zone.over { border-color: var(--accent); background: rgba(54,101,182,.12); }
 .drop-zone strong { display: block; margin-bottom: 4px; }
 .drop-zone small { color: var(--muted); }
+.drops { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.drops .drop-zone { padding: 20px 12px; }
+.chip .rm { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0 2px; }
+.chip .rm:hover { color: var(--text); }
+#mapTrackField[hidden], #trackSelect[hidden] { display: none; }
+#trackSelect { width: auto; max-width: 40%; padding: 4px 8px; font-size: .78rem; }
 .chips { display: flex; flex-direction: column; gap: 6px; }
 .chip { display: flex; align-items: center; gap: 8px; font-size: .8rem; padding: 6px 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; }
 .chip .kind { font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--accent-h); min-width: 52px; }

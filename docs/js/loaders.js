@@ -3,15 +3,18 @@ import * as THREE from 'three';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
-import { parseBVH } from './mocap-bake.mjs';
+import { parseBVH, motionFromBVH, motionsFromObject } from './mocap-bake.mjs';
 
 export const MODEL_EXT = /\.(fbx|glb|gltf|vrm|json)$/i;
 export const MOTION_EXT = /\.bvh$/i;
+export const MODEL_ACCEPT = '.fbx,.glb,.gltf,.vrm,.json';
+export const MOTION_ACCEPT = '.bvh,.fbx,.glb,.gltf';
 
-export function classify(name) {
+// `role` says which upload a file came through: FBX / GLB / glTF can be a character or an animation source.
+export function classify(name, role) {
   if (MOTION_EXT.test(name)) return 'motion';
   if (/\.json$/i.test(name)) return 'json'; // either a Mesquite rig.json or a saved bone map -- sniffed by content
-  if (MODEL_EXT.test(name)) return 'model';
+  if (/\.(fbx|glb|gltf|vrm)$/i.test(name)) return role === 'motion' ? 'motion' : 'model';
   return null;
 }
 
@@ -41,19 +44,26 @@ export async function loadModel(buf, name) {
   let settle; const done = new Promise(r => { settle = r; });
   const manager = new THREE.LoadingManager(() => settle());
   manager.itemStart('guard'); setTimeout(() => manager.itemEnd('guard'), 0);
-  let model;
-  if (/\.fbx$/i.test(name)) model = new FBXLoader(manager).parse(buf, '');
+  let model, animations = [];
+  if (/\.fbx$/i.test(name)) { model = new FBXLoader(manager).parse(buf, ''); animations = model.animations; }
   else if (/\.json$/i.test(name)) {
     const json = JSON.parse(new TextDecoder().decode(buf));
     model = await new THREE.ObjectLoader().parseAsync(json.scene ?? json);
-  } else model = (await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).parseAsync(buf, '')).scene;
+  } else { const gltf = await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).parseAsync(buf, ''); model = gltf.scene; animations = gltf.animations; }
   await Promise.race([done, new Promise(r => setTimeout(r, 20000))]);
   const dropped = dropUnresolvedTextures(model);
-  return { model, dropped, ms: Math.round(performance.now() - t0) };
+  return { model, animations, dropped, ms: Math.round(performance.now() - t0) };
 }
 
 export function loadMotion(text) {
   const t0 = performance.now();
   const bvh = parseBVH(text);
-  return { bvh, ms: Math.round(performance.now() - t0) };
+  return { bvh, source: motionFromBVH(bvh), ms: Math.round(performance.now() - t0) };
+}
+
+// An FBX / GLB animation file yields one motion per clip it carries.
+export async function loadMotionFile(buf, name) {
+  const { model, animations, ms } = await loadModel(buf, name);
+  const sources = motionsFromObject(model, animations);
+  return { sources, ms };
 }

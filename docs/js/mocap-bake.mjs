@@ -45,6 +45,25 @@ export function parseBVH(text) {
   return bvh;
 }
 
+// A motion source is { bones, root, clip }: `root` is added to a scratch group and animated by `clip`; `bones` are the
+// joints the clip drives. A BVH is one; so is every clip of an FBX / GLB animation file.
+export const motionFromBVH = bvh => ({ bones: bvh.skeleton.bones, root: bvh.skeleton.bones[0], clip: bvh.clip });
+
+export function motionsFromObject(object, animations) {
+  if (!animations?.length) throw new Error('The file has no animation clips.');
+  let bones = []; object.traverse(o => { if (o.isBone) bones.push(o); });
+  if (!bones.length) { // animation-only glTF: joints are plain nodes, found through the clips' track targets
+    const seen = new Set();
+    for (const clip of animations) for (const t of clip.tracks) {
+      const n = t.name.slice(0, t.name.lastIndexOf('.')), o = object.getObjectByName(n);
+      if (o && !seen.has(o)) { seen.add(o); bones.push(o); }
+    }
+  }
+  if (bones.length < 2) throw new Error('No skeleton found in the animation file.');
+  object.updateMatrixWorld(true);
+  return animations.map(clip => ({ bones, root: object, clip }));
+}
+
 // Rig normalization. FBXLoader (and rigs saved from it, e.g. Mesquite's rig.json) can nest a same-named
 // "twin" bone under each real bone, one set per skin. Collapse twins onto their parent, rebind every skin
 // to the shared bones, and treat the union of all skins' bones as one skeleton (multi-mesh characters).
@@ -79,12 +98,14 @@ export function normalizeRig(model) {
   return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed };
 }
 
-// `override` maps a target bone's canonical name -> BVH bone name; an empty string pins the bone to rest pose.
+// `override` maps a target bone's canonical name -> source bone name; an empty string pins the bone to rest pose.
+// An override naming a bone this source does not have is ignored, so one map can serve tracks with different skeletons.
 export function mapBones(targetBones, sourceBones, override = {}) {
   const src = new Map(sourceBones.map(b => [canonical(b.name), b.name]));
+  const have = new Set(sourceBones.map(b => b.name));
   const names = {}, rows = [];
   for (const b of targetBones) {
-    const c = canonical(b.name), forced = Object.hasOwn(override, c);
+    const c = canonical(b.name), forced = Object.hasOwn(override, c) && (override[c] === '' || have.has(override[c]));
     const s = forced ? override[c] : src.get(c);
     if (s) names[b.name] = s;
     rows.push({ target: b.name, canonical: c, source: s || null, manual: forced });
@@ -104,7 +125,8 @@ export function analyzeMapping(tgt, sourceBones, override = {}) {
   return { ...m, findCore, missingCore, hips: hips && m.names[hips.name] ? hips : null };
 }
 
-export function bakeMocap(model, bvh, { fps = 30, map = {}, align = true, trim = null, inPlace = false, loop = false } = {}) {
+export function bakeMocap(model, source, { fps = 30, map = {}, align = true, trim = null, inPlace = false, loop = false, name = 'mocap' } = {}) {
+  const motion = source.skeleton ? motionFromBVH(source) : source;
   const stages = [];
   const stage = (n, name, info, t) => stages.push({ n, name, ms: +(performance.now() - t).toFixed(1), info });
   let t = performance.now();
@@ -114,13 +136,13 @@ export function bakeMocap(model, bvh, { fps = 30, map = {}, align = true, trim =
   stage(2, 'normalize rig', { bones: tgt.length, skins: rig.skins, removedTwinBones: rig.removedTwinBones }, t);
 
   t = performance.now();
-  const { names, rows, unmapped, findCore, missingCore, hips: hipT } = analyzeMapping(tgt, bvh.skeleton.bones, map);
+  const { names, rows, unmapped, findCore, missingCore, hips: hipT } = analyzeMapping(tgt, motion.bones, map);
   if (!hipT) throw new Error('Could not map the hips bone; supply map.Hips (BVH bone name) in the mapping panel or --map file.');
   stage(3, 'map bones', { mapped: Object.keys(names).length, unmapped: unmapped.length, missingCore }, t);
 
   t = performance.now();
-  const srcRoot = new THREE.Group(); srcRoot.add(bvh.skeleton.bones[0]);
-  const srcMap = new Map(bvh.skeleton.bones.map(b => [b.name, b]));
+  const srcRoot = new THREE.Group(); srcRoot.add(motion.root);
+  const srcMap = new Map(motion.bones.map(b => [b.name, b]));
   const depth = b => { let d = 0; for (let p = b.parent; p?.isBone; p = p.parent) d++; return d; };
   const order = [...tgt].sort((a, b) => depth(a) - depth(b));
   const wq = o => o.getWorldQuaternion(new THREE.Quaternion());
@@ -157,13 +179,13 @@ export function bakeMocap(model, bvh, { fps = 30, map = {}, align = true, trim =
   const hipParentInv = wq(hipT.parent).invert();
   const hipParentScale = hipT.parent.getWorldScale(new THREE.Vector3());
 
-  const D = bvh.clip.duration;
+  const D = motion.clip.duration;
   const t0 = Math.min(Math.max(trim?.[0] ?? 0, 0), D), t1 = Math.min(Math.max(trim?.[1] ?? D, t0), D);
   const n = Math.floor((t1 - t0) * fps + 1e-9) + 1;
   if (n < 2) throw new Error(`Trim window ${t0.toFixed(2)}-${t1.toFixed(2)} s is too short at ${fps} fps.`);
   const times = new Float32Array(n);
   const qv = new Map(order.map(b => [b, new Float32Array(n * 4)])), pv = new Float32Array(n * 3);
-  const mixer = new THREE.AnimationMixer(srcRoot); mixer.clipAction(bvh.clip).play();
+  const mixer = new THREE.AnimationMixer(srcRoot); mixer.clipAction(motion.clip).play();
   const curW = new Map(), p0 = new THREE.Vector3(), hp = new THREE.Vector3();
   for (let i = 0; i < n; i++) {
     times[i] = i / fps; mixer.setTime(t0 + times[i]); srcRoot.updateMatrixWorld(true);
@@ -174,11 +196,12 @@ export function bakeMocap(model, bvh, { fps = 30, map = {}, align = true, trim =
       curW.set(b, pW.clone().multiply(local));
       local.toArray(qv.get(b), i * 4);
     }
-    hp.copy(hipS.position);
+    hipS.getWorldPosition(hp);
     if (i === 0) p0.copy(hp);
     if (inPlace) { hp.x = p0.x; hp.z = p0.z; } // BVH is Y-up: drop horizontal travel, keep hip height
     hp.multiplyScalar(scale).applyQuaternion(hipParentInv).divide(hipParentScale).toArray(pv, i * 3);
   }
+  mixer.stopAllAction(); mixer.uncacheRoot(srcRoot); // put the source back in its rest pose for the next bake
   stage(5, 'transfer rotations', { frames: n, window: [+t0.toFixed(3), +t1.toFixed(3)] }, t);
   t = performance.now();
 
@@ -191,7 +214,7 @@ export function bakeMocap(model, bvh, { fps = 30, map = {}, align = true, trim =
   const tracks = [...qv].map(([b, a]) => new THREE.QuaternionKeyframeTrack(`${b.name}.quaternion`, times, a));
   tracks.push(new THREE.VectorKeyframeTrack(`${hipT.name}.position`, times, pv));
   rig.poseAll(); // leave the model in bind pose for export
-  const clip = new THREE.AnimationClip('mocap', times[n - 1], tracks);
+  const clip = new THREE.AnimationClip(name, times[n - 1], tracks);
   stage(6, 'root motion', { rootScale: +scale.toFixed(3), inPlace, loop, hip: hipT.name }, t);
 
   return {
