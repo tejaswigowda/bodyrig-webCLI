@@ -1,5 +1,8 @@
 # bodyrig-webCLI
 
+<img src='demo.gif'>
+<sub>Demo: characters from [Mixamo](https://www.mixamo.com) (Adobe). See [Attribution](#attribution).</sub>
+
 A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM or Mesquite `rig.json`) and any number of animations (BVH, FBX or GLB), retarget each onto the character's **own skeleton**, and export one animated, web-optimized **GLB** that carries every animation as its own track.
 <b><ins>No uploads, no servers: everything happens in your browser.</ins></b> Pure ES modules, no build step for the app (three.js and the optimizer are vendored in `docs/vendor`, so the whole app is same-origin and works offline).
 
@@ -21,6 +24,10 @@ npm start       # http://127.0.0.1:8010 (any static host works; no COOP/COEP nee
 ```
 
 Click **Try with the sample**, or drop a character into **Character** and one or more animations into **Animation tracks**. A bake starts as soon as there is a character and at least one track.
+
+## Sample character
+
+X Bot and Y Bot are Mixamo (Adobe) characters and are not stored in this repository. **Try with the sample** downloads X Bot from jsDelivr, pinned to a commit of [miver-player/miver.xyz](https://github.com/miver-player/miver.xyz) (`docs/js/samples.js` holds the URLs and SHA-256 checksums); the 33 s mocap clip is served from this site. It is a plain `GET` that sends nothing, it only happens when you click the button, and the service worker caches it afterwards so the sample works offline. Everything else stays same-origin.
 
 ## Animation tracks
 
@@ -99,7 +106,7 @@ Connect to a BVH-style WebSocket on your own machine or LAN. The page only reads
 
 ## Optional local AI assist
 
-Off by default and never required. **Load model** downloads about 1 GB of WebLLM weights once (the only network use in the app; your files are never sent). Following Strata's host-first split, the model only sees the fuzzy residue:
+Off by default and never required. **Load model** downloads about 1 GB of WebLLM weights once (the only network use in the app besides the optional sample character; your files are never sent). Following Strata's host-first split, the model only sees the fuzzy residue:
 
 - **Unknown bone labeling.** Bones the synonym table missed are labeled from a closed enum of the 22 canonical names with constrained decoding. The host then checks each label geometrically before accepting it: left bones on the left, chain order, up/down position, midline, plausible segment lengths. Wrong labels are rejected and listed, never baked.
 - **Natural language to options.** "trim to 2 to 10 s, 30 fps, loop, in place" becomes a command, which is validated by the real command grammar and shown for review before you run it.
@@ -113,7 +120,7 @@ Online retargeters and animation services upload your character and your capture
 
 ## Verify zero egress
 
-Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled.
+Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled. The one exception, the sample button's download from jsDelivr, is tested separately with the CDN request intercepted, asserting it is exactly one `GET` to the pinned URL.
 
 ## Testing (Playwright is the dev loop, not the product)
 
@@ -162,7 +169,11 @@ scripts/vendor.mjs     copies and minifies the vendored dependencies
 tests/                 unit tests, Playwright matrix, verifier, fixtures, golden frames
 ```
 
-Fixtures: Mixamo X Bot and Y Bot, and a 33 s motion capture clip downsampled to 30 fps.
+Fixtures: a 33 s motion capture clip downsampled to 30 fps is committed. Mixamo (Adobe) X Bot and Y Bot are downloaded from the CDN on the first test run (`tests/fetch-fixtures.mjs`, SHA-256 verified, git-ignored), so running the tests needs network access once.
+
+## Attribution
+
+The characters in the demo GIF, the sample button, the tests and the measurements in this README are from [Mixamo](https://www.mixamo.com) by Adobe: **X Bot** and **Y Bot**, and the other Mixamo FBX characters used while developing and measuring (for example the textured Mixamo character in the size figures above). Mixamo and its characters are Adobe's; they are not part of this project, are not covered by this project's license, and are not redistributed here (X Bot and Y Bot are fetched from a CDN, see [Sample character](#sample-character)). Use them under [Adobe's Mixamo terms](https://helpx.adobe.com/creative-cloud/faq/mixamo-faq.html).
 
 ## License
 

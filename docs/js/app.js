@@ -7,6 +7,7 @@ import { parseCommand, formatCommand, DEFAULTS, PRESETS, EXAMPLES, HELP } from '
 import { explainReport, groupUnmapped } from './advice.js';
 import { connectLive } from './live.js';
 import * as ai from './ai.js';
+import { SAMPLE_CHARACTERS } from './samples.js';
 
 const $ = id => document.getElementById(id);
 const viewer = createViewer($('viewer'));
@@ -258,7 +259,8 @@ window.addEventListener('drop', e => { e.preventDefault(); ingestFiles(e.dataTra
 
 $('btnSample').onclick = async () => {
   try {
-    const [m, b] = await job('Fetching the sample...', () => Promise.all(['samples/xbot.fbx', 'samples/mocap-33s.bvh'].map(u => fetch(u).then(r => { if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer(); }))));
+    const get = u => fetch(u).then(r => { if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer(); });
+    const [m, b] = await job('Fetching the sample...', () => Promise.all([get(SAMPLE_CHARACTERS.xbot.url), get('samples/mocap-33s.bvh')]));
     await ingest('xbot.fbx', m, 'model'); await ingest('mocap-33s.bvh', b, 'motion');
     await execute('bake');
   } catch (e) { fail(e); }

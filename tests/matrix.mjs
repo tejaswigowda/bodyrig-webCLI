@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { WebSocketServer } from 'ws';
 import { createServer } from '../server.js';
+import { ensureFixtures } from './fetch-fixtures.mjs';
+import { SAMPLE_CHARACTERS } from '../docs/js/samples.js';
 import { verifyGLB, compareGolden } from './verify.mjs';
 import { buildSyntheticRig } from './synthetic-rig.mjs';
 
@@ -16,6 +18,7 @@ const outDir = path.join(root, 'tests', 'out'), goldenDir = path.join(root, 'tes
 const UPDATE = process.argv.includes('--update-golden');
 const MAX_MEAN_DEG = 3, MAX_P95_DEG = 8;
 fs.mkdirSync(outDir, { recursive: true }); fs.mkdirSync(goldenDir, { recursive: true });
+await ensureFixtures(); // X Bot / Y Bot are fetched from the CDN, not stored in the repo
 
 const server = createServer(path.join(root, 'docs'), { '/fixtures/': fixtures, '/local/': localFixtures, '/out/': outDir });
 await new Promise(r => server.listen(0, '127.0.0.1', r));
@@ -240,6 +243,18 @@ try {
   console.log(`live: ${r.frames} frames, mean limb error ${ver.meanLimbErrorDeg} deg`);
   await live.close(); wss.close();
 } catch (e) { failures.push(`live: ${e.message}`); }
+
+// ---- sample button: X Bot comes from the CDN (stubbed with the verified local copy), the BVH from this origin ----
+try {
+  const sc = await browser.newContext({ serviceWorkers: 'block' }), seen = [];
+  await sc.route('https://cdn.jsdelivr.net/**', route => { seen.push(route.request().url()); route.fulfill({ status: 200, body: fs.readFileSync(path.join(fixtures, 'xbot.fbx')), headers: { 'access-control-allow-origin': '*', 'content-type': 'application/octet-stream' } }); });
+  const sp = await sc.newPage(); await sp.goto(`${origin}/index.html?nosw`);
+  await sp.click('#btnSample');
+  await sp.waitForSelector('#resultCard:not([hidden])', { timeout: 60000 });
+  check(seen.length === 1 && seen[0] === SAMPLE_CHARACTERS.xbot.url, `sample: expected exactly one request, to the pinned X Bot URL; got ${JSON.stringify(seen)}`);
+  check(await sp.evaluate(() => window.bodyrigWebCLI.state.modelName) === 'xbot.fbx', 'sample: X Bot did not load');
+  await sc.close();
+} catch (e) { failures.push(`sample: ${e.message}`); }
 
 // ---- zero egress: every request so far stayed on this origin, nothing carried a body ----
 const foreign = requests.filter(r => !r.url.startsWith(origin) && !/^(data|blob):/.test(r.url));
