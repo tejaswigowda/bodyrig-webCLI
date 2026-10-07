@@ -5,7 +5,7 @@ A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM 
 
 <img src='demo.gif'>
 <br>
-<sub>Demo: characters from <a href="https://www.mixamo.com">Mixamo</a> (Adobe). See <a href="#attribution">Attribution</a>.</sub>
+<sub>Demo: characters from <a target='_blank' href="https://www.mixamo.com">Mixamo</a> (Adobe). See <a href="#attribution">Attribution</a>.</sub>
 
 
 ## Paper
