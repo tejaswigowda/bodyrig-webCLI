@@ -7,6 +7,26 @@ A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM 
 <br>
 <sub>Demo: characters from <a target='_blank' href="https://www.mixamo.com">Mixamo</a> (Adobe). See <a href="#attribution">Attribution</a>.</sub>
 
+> **The output is a standard glTF 2.0 file, so it drops into any renderer or engine and plays natively.** Every animation is embedded as its own named clip on the character's own skeleton, with no runtime retargeting, no plugin and no custom player code: load the GLB, pick a clip by name, play it. That works in three.js, Babylon.js, model-viewer, Godot and Blender, and in other engines through their glTF importers.
+>
+> ```js
+> // three.js
+> const gltf = await new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).loadAsync('hero.glb');
+> const mixer = new THREE.AnimationMixer(gltf.scene);
+> mixer.clipAction(THREE.AnimationClip.findByName(gltf.animations, 'walk')).play();
+> ```
+>
+> ```html
+> <!-- model-viewer: no code at all -->
+> <model-viewer src="hero.glb" animation-name="walk" autoplay camera-controls></model-viewer>
+> ```
+>
+> ```js
+> // Babylon.js (after SceneLoader.ImportMeshAsync)
+> scene.getAnimationGroupByName('walk').start(true);
+> ```
+>
+> The default GLB is meshopt-compressed: three.js (with `MeshoptDecoder`, as above), Babylon.js and model-viewer read it directly. For Godot, Blender or any importer without meshopt support, untick **Meshopt compress** (`--no-optimize`) to get plain glTF 2.0 with no required extensions. See [Honest limitations](#honest-limitations).
 
 ## Paper
 
