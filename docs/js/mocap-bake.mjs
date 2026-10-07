@@ -110,17 +110,23 @@ export function normalizeRig(model) {
 
 // `override` maps a target bone's canonical name -> source bone name; an empty string pins the bone to rest pose.
 // An override naming a bone this source does not have is ignored, so one map can serve tracks with different skeletons.
+// When several target bones share a canonical name (VRM has both "Root" and "J_Bip_C_Hips" for Hips) only the deepest one
+// is mapped; the others hold their rest pose, so the real hips carry the motion and the root stays put.
 export function mapBones(targetBones, sourceBones, override = {}) {
   const src = new Map(sourceBones.map(b => [canonical(b.name), b.name]));
   const have = new Set(sourceBones.map(b => b.name));
+  const depth = b => { let d = 0; for (let p = b.parent; p?.isBone; p = p.parent) d++; return d; };
+  const best = new Map();
+  for (const b of targetBones) { const c = canonical(b.name), cur = best.get(c); if (!cur || depth(b) > depth(cur)) best.set(c, b); }
   const names = {}, rows = [];
   for (const b of targetBones) {
-    const c = canonical(b.name), forced = Object.hasOwn(override, c) && (override[c] === '' || have.has(override[c]));
-    const s = forced ? override[c] : src.get(c);
+    const c = canonical(b.name), chosen = best.get(c) === b;
+    const forced = chosen && Object.hasOwn(override, c) && (override[c] === '' || have.has(override[c]));
+    const s = !chosen ? null : forced ? override[c] : src.get(c);
     if (s) names[b.name] = s;
     rows.push({ target: b.name, canonical: c, source: s || null, manual: forced });
   }
-  return { names, rows, unmapped: targetBones.filter(b => !names[b.name]).map(b => b.name) };
+  return { names, rows, best, unmapped: targetBones.filter(b => !names[b.name]).map(b => b.name) };
 }
 
 export const sourceBoneNames = bvh => bvh.skeleton.bones.map(b => b.name);
@@ -128,7 +134,7 @@ export const sourceBoneNames = bvh => bvh.skeleton.bones.map(b => b.name);
 // Mapping plus the bookkeeping the GUI and the bake both need.
 export function analyzeMapping(tgt, sourceBones, override = {}) {
   const m = mapBones(tgt, sourceBones, override);
-  const findCore = c => tgt.find(b => canonical(b.name) === c) ?? tgt.find(b => m.names[b.name] && canonical(m.names[b.name]) === c);
+  const findCore = c => m.best.get(c) ?? tgt.find(b => m.names[b.name] && canonical(m.names[b.name]) === c);
   const claimed = new Set(m.rows.filter(r => r.source).map(r => canonical(r.source)));
   const missingCore = CORE_BONES.filter(c => !claimed.has(c) && !findCore(c));
   const hips = findCore('Hips');
@@ -278,6 +284,23 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   };
 
   rig.poseAll(); srcRoot.updateMatrixWorld(true);
+  // Facing: a model that looks along a different horizontal axis than the source (VRM 0.x faces -Z, Mixamo and BVH +Z) would
+  // walk backwards, and swing-only alignment cannot see a rotation about the vertical. Measure it from the left/right
+  // hips (or arms) and carry every source rotation and the root path across by that yaw.
+  let yaw = 0;
+  {
+    const pair = [['LeftUpLeg', 'RightUpLeg'], ['LeftArm', 'RightArm']].map(([l, r]) => [findCore(l), findCore(r)]).find(([l, r]) => l && r && srcMap.get(names[l.name]) && srcMap.get(names[r.name]));
+    if (pair) {
+      const lat = (a, b) => wp(b).sub(wp(a)).setY(0);
+      const vt = lat(pair[0], pair[1]), vs = lat(srcMap.get(names[pair[0].name]), srcMap.get(names[pair[1].name]));
+      if (vt.length() > 1e-6 && vs.length() > 1e-6) {
+        const a = Math.atan2(vt.x, vt.z) - Math.atan2(vs.x, vs.z);
+        yaw = Math.atan2(Math.sin(a), Math.cos(a));
+        if (Math.abs(yaw) < 0.05) yaw = 0;
+      }
+    }
+  }
+  const Ry = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw), RyInv = Ry.clone().invert();
   const lockLegs = {}, srcFeetBones = {}, srcFeet = {}, footRestY = {}; // foot lock needs a full, mapped leg chain on both skeletons
   if (footLock && !inPlace) for (const [s, pre] of [['L', 'Left'], ['R', 'Right']]) {
     const up = findCore(`${pre}UpLeg`), knee = findCore(`${pre}Leg`), foot = findCore(`${pre}Foot`), sf = foot && srcMap.get(names[foot.name]);
@@ -289,7 +312,7 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
     for (const b of order) {
       const s = srcMap.get(names[b.name]); if (!s) continue;
       const c = firstMapped(b); if (!c) continue;
-      const dT = wp(c).sub(wp(b)).normalize(), dS = wp(srcMap.get(names[c.name])).sub(wp(s)).normalize();
+      const dT = wp(c).sub(wp(b)).normalize(), dS = wp(srcMap.get(names[c.name])).sub(wp(s)).normalize().applyQuaternion(Ry);
       const swing = new THREE.Quaternion().setFromUnitVectors(dT, dS);
       swingDeg[b.name] = +THREE.MathUtils.radToDeg(2 * Math.acos(Math.min(1, Math.abs(swing.w)))).toFixed(1);
       const w = swing.multiply(wq(b));
@@ -298,7 +321,7 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   }
   const refW = new Map(order.map(b => [b, wq(b)]));
   const srcRestInv = new Map([...srcMap].map(([n, b]) => [n, wq(b).invert()]));
-  stage(4, 'align reference pose', { enabled: align, swingDeg }, t);
+  stage(4, 'align reference pose', { enabled: align, facingYawDeg: +THREE.MathUtils.radToDeg(yaw).toFixed(1), swingDeg }, t);
 
   t = performance.now();
   const hipS = srcMap.get(names[hipT.name]);
@@ -321,11 +344,14 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
     for (const b of order) {
       const s = srcMap.get(names[b.name]);
       const pW = curW.get(b.parent) ?? wq(b.parent);
-      const local = s ? pW.clone().invert().multiply(wq(s).multiply(srcRestInv.get(s.name)).multiply(refW.get(b))) : restL.get(b).clone();
+      const delta = s ? wq(s).multiply(srcRestInv.get(s.name)) : null;
+      if (delta && yaw) delta.premultiply(Ry).multiply(RyInv);
+      const local = s ? pW.clone().invert().multiply(delta.multiply(refW.get(b))) : restL.get(b).clone();
       curW.set(b, pW.clone().multiply(local));
       local.toArray(qv.get(b), i * 4);
     }
     hipS.getWorldPosition(hp);
+    if (yaw) hp.applyQuaternion(Ry);
     if (i === 0) p0.copy(hp);
     if (inPlace) { hp.x = p0.x; hp.z = p0.z; } // BVH is Y-up: drop horizontal travel, keep hip height
     hp.multiplyScalar(scale).applyQuaternion(hipParentInv).divide(hipParentScale).toArray(pv, i * 3);

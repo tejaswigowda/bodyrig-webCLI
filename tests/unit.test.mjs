@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, formatCommand, parseTrim, DEFAULTS, PRESETS, EXAMPLES } from '../docs/js/command.js';
 import { parseChannels, parseFrameMessage, resample, buildBVH, LiveRecorder } from '../docs/js/live.js';
-import { canonical, CORE_BONES, parseBVH } from '../docs/js/mocap-bake.mjs';
+import { canonical, CORE_BONES, parseBVH, mapBones } from '../docs/js/mocap-bake.mjs';
+import * as THREE from 'three';
 import { validateLabels, describeBones } from '../docs/js/ai.js';
 import { explainReport } from '../docs/js/advice.js';
 import { isMapJSON, classify } from '../docs/js/loaders.js';
@@ -83,6 +84,17 @@ test('bvh: root OFFSET is added to the channels unless they are already absolute
   assert.equal(y0(bvh('0 0 0', '0 99 0')), 99, 'zero offset');
   assert.equal(y0(bvh('0 10 0', '0 0 0')), 10, 'channels relative to the offset keep the standard additive meaning');
   assert.equal(parseBVH(bvh('0 10 0', '0 0 0')).absoluteRootPosition, undefined);
+});
+
+test('mapping: of two bones sharing a canonical name only the deepest is mapped (VRM Root + Hips)', () => {
+  const bone = n => Object.assign(new THREE.Bone(), { name: n });
+  const root = bone('Root'), hips = bone('J_Bip_C_Hips'), spine = bone('J_Bip_C_Spine');
+  root.add(hips); hips.add(spine);
+  const m = mapBones([root, hips, spine], [{ name: 'Hips' }, { name: 'Spine' }]);
+  assert.equal(m.names.J_Bip_C_Hips, 'Hips');
+  assert.equal(m.names.Root, undefined, 'the root must not also take the Hips motion');
+  assert.equal(m.names.J_Bip_C_Spine, 'Spine');
+  assert.equal(m.best.get('Hips'), hips);
 });
 
 test('upload roles: FBX / GLB are a character or an animation depending on the zone', () => {

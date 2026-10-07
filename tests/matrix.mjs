@@ -186,6 +186,33 @@ try {
   console.log(`tracks: ${r.tracks.join(' + ')} -> ${v0.animations.length} animations, limb error ${v0.meanLimbErrorDeg} / ${v1.meanLimbErrorDeg} deg`);
 } catch (e) { failures.push(`tracks: ${e.message}`); }
 
+// ---- facing: a model that looks along -Z (VRM 0.x) must walk forwards, not backwards; a +Z model is the control ----
+try {
+  // Y-up rigs with identity parents (three's Skeleton.pose() mishandles a transformed Armature node), facing +Z or -Z
+  const variant = remap => { const out = buildSyntheticRig.toString().replace('new THREE.Vector3(...p)', remap).replace('armature.rotation.x = -Math.PI / 2;', '').replace('mesh.rotation.x = -Math.PI / 2;', ''); if (out === buildSyntheticRig.toString()) throw new Error('synthetic rig source changed'); return out; };
+  const rigs = { plusZ: variant('new THREE.Vector3(p[0], p[2], -p[1])'), minusZ: variant('new THREE.Vector3(-p[0], p[2], p[1])') };
+  for (const [id, src] of Object.entries(rigs)) {
+    const r = await page.evaluate(async ({ src, bvh }) => {
+      const THREE = await import('/vendor/three/three.module.js');
+      const rig = await (0, eval)(`(${src})`)();
+      const out = await window.bodyrigWebCLI.bakeObject(rig, await (await fetch(bvh)).text(), 'bake --no-optimize --trim 0:8 --fps 15');
+      const st = window.bodyrigWebCLI.state, clip = st.last.clips[0], source = st.motions[0].source;
+      let hipT; rig.traverse(o => { if (o.name === 'pelvis') hipT = o; });
+      const mt = new THREE.AnimationMixer(rig); mt.clipAction(clip).play();
+      const ms = new THREE.AnimationMixer(source.root); ms.clipAction(source.clip).play();
+      const at = t => { mt.setTime(t); ms.setTime(t); rig.updateMatrixWorld(true); source.root.updateMatrixWorld(true); return [hipT.getWorldPosition(new THREE.Vector3()), source.bones[0].getWorldPosition(new THREE.Vector3())]; };
+      const [t0, s0] = at(0), [t1, s1] = at(7.5);
+      const dT = t1.clone().sub(t0).setY(0), dS = s1.clone().sub(s0).setY(0), deg = THREE.MathUtils.radToDeg;
+      const info = out.report.stages.find(s => s.n === 4).info;
+      return { yaw: info.facingYawDeg, travel: dS.length(), vsSame: deg(dT.angleTo(dS)), vsFlipped: deg(dT.angleTo(dS.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI))), swingMax: Math.max(...Object.values(info.swingDeg)) };
+    }, { src, bvh: `/fixtures/${BVH}` });
+    const want = id === 'minusZ' ? 180 : 0;
+    check(Math.abs(Math.abs(r.yaw) - want) < 5, `facing ${id}: expected a ${want} deg facing correction, got ${r.yaw}`);
+    check(r.travel > 20 && (id === 'minusZ' ? r.vsFlipped : r.vsSame) < 15, `facing ${id}: root travel off by ${(id === 'minusZ' ? r.vsFlipped : r.vsSame).toFixed(0)} deg from where the model's own forward points (${r.vsSame.toFixed(0)} from the raw source path)`);
+    check(r.swingMax < 60, `facing ${id}: alignment swings up to ${r.swingMax} deg, so a flipped side was not corrected`);
+  }
+} catch (e) { failures.push(`facing: ${e.message}`); }
+
 // ---- export fidelity: FBX-style "transparent at opacity 1" materials must not export as BLEND ----
 try {
   const r = await page.evaluate(async () => {
