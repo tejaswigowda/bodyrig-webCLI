@@ -4,7 +4,8 @@ A browser-based mocap retargeting tool: load a skinned character (FBX, GLB, VRM 
 <b><ins>No uploads, no servers: everything happens in your browser.</ins></b> Pure ES modules, no build step for the app (three.js and the optimizer are vendored in `docs/vendor`, so the whole app is same-origin and works offline).
 
 <img src='demo.gif'>
-<sub>Demo: characters from [Mixamo](https://www.mixamo.com) (Adobe). See [Attribution](#attribution).</sub>
+<br>
+<sub>Demo: characters from <a href="https://www.mixamo.com">Mixamo</a> (Adobe). See <a href="#attribution">Attribution</a>.</sub>
 
 
 ## Paper
