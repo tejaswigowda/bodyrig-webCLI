@@ -162,3 +162,29 @@ test('ai: bone descriptions carry side and height but no raw geometry', () => {
   assert.equal(d.side, 'left'); assert.ok(d.height > 0.3); assert.match(d.parents, /clavicle|LeftShoulder/i);
   assert.deepEqual(Object.keys(d).sort(), ['bone', 'children', 'height', 'parents', 'side']);
 });
+
+test('webcli: URL is the primitive, owner/repo@ref:path is sugar', async () => {
+  const { expandSource, rawFallback, parseRunParams, sniffExt, fetchInput } = await import('../docs/js/webcli.js');
+  assert.equal(expandSource('https://example.com/a@b:c.glb'), 'https://example.com/a@b:c.glb');
+  assert.equal(expandSource('/fixtures/x.fbx'), '/fixtures/x.fbx');
+  assert.equal(expandSource('data:text/plain;base64,AAAA'), 'data:text/plain;base64,AAAA');
+  assert.equal(expandSource('me/rigs@abc123:chars/hero.glb'), 'https://cdn.jsdelivr.net/gh/me/rigs@abc123/chars/hero.glb');
+  assert.equal(rawFallback('https://raw.githubusercontent.com/me/rigs/main/a/b.glb'), 'https://cdn.jsdelivr.net/gh/me/rigs@main/a/b.glb');
+  assert.equal(rawFallback('https://example.com/a.glb'), null);
+  const p = parseRunParams('?character=a.glb&motion=b.bvh&motion=c.bvh&run=bake&args=--fps%2024');
+  assert.deepEqual([p.character, p.motion, p.run, p.args, p.requested], ['a.glb', ['b.bvh', 'c.bvh'], 'bake', '--fps 24', true]);
+  assert.equal(parseRunParams('').requested, false);
+  assert.throws(() => parseRunParams('?run=push'), /Unknown run/);
+  assert.throws(() => parseRunParams('?run=bake&character=a.glb'), /needs character/);
+  const bytes = s => new TextEncoder().encode(s).buffer;
+  assert.equal(sniffExt(bytes('glTF....')), '.glb');
+  assert.equal(sniffExt(bytes('HIERARCHY\nROOT')), '.bvh');
+  assert.equal(sniffExt(bytes('Kaydara FBX Binary  ')), '.fbx');
+  const calls = [];
+  const fake = async (u, init) => { calls.push({ u, init }); return u.includes('raw.') ? { ok: false, status: 429 } : { ok: true, arrayBuffer: async () => bytes('HIERARCHY') }; };
+  const r = await fetchInput('https://raw.githubusercontent.com/me/rigs/main/walk', 'motion-1', fake);
+  assert.equal(r.name, 'walk.bvh');
+  assert.ok(calls.every(c => c.init.method === 'GET' && !c.init.body && c.init.credentials === 'omit'));
+  assert.equal(calls.length, 2);
+  assert.equal((await fetchInput('data:application/octet-stream;base64,AAAA', 'motion-2', fake)).name, 'motion-2.bvh');
+});

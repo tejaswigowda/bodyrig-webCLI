@@ -48,8 +48,8 @@
               <small>BVH, FBX or GLB<br>Drop or click. Add as many as you like; each becomes its own track.</small>
             </div>
           </div>
-          <input type="file" id="modelInput" hidden accept=".fbx,.glb,.gltf,.vrm,.json">
-          <input type="file" id="motionInput" multiple hidden accept=".bvh,.fbx,.glb,.gltf">
+          <input type="file" id="modelInput" data-testid="character-input" hidden accept=".fbx,.glb,.gltf,.vrm,.json">
+          <input type="file" id="motionInput" data-testid="motion-input" multiple hidden accept=".bvh,.fbx,.glb,.gltf">
           <div class="chips" id="chips"></div>
           <button class="btn btn-ghost btn-sm" id="btnSample">Try with the sample (X Bot + 33 s mocap)</button>
         </div>
@@ -73,14 +73,14 @@
             <label title="Pin planted feet and correct the legs with two-bone IK. Not used with In place."><input type="checkbox" id="footLock"> Foot lock + IK</label>
             <label><input type="checkbox" id="optimize" checked> Meshopt compress</label>
           </div>
-          <button class="btn btn-primary btn-block" id="btnBake" disabled>Bake &amp; export GLB</button>
+          <button class="btn btn-primary btn-block" id="btnBake" data-testid="bake" disabled>Bake &amp; export GLB</button>
         </div>
       </div>
 
       <div class="card">
         <div class="card-header">3 &middot; Command <span class="pill">raw control</span></div>
         <div class="card-body">
-          <div class="cmdline"><span class="prompt">$</span><input type="text" id="cmd" class="cmd" spellcheck="false" autocomplete="off" value="bake"><button class="btn btn-ghost btn-sm" id="btnRun">Run</button></div>
+          <div class="cmdline"><span class="prompt">$</span><input type="text" id="cmd" data-testid="command" class="cmd" spellcheck="false" autocomplete="off" value="bake"><button class="btn btn-ghost btn-sm" id="btnRun" data-testid="run">Run</button></div>
           <div class="note">Every control above is just this command. Edit it directly, or run <b>help</b>.</div>
           <details>
             <summary class="note" style="cursor:pointer"><b>Example library</b></summary>
@@ -132,11 +132,11 @@
         </div>
       </div>
 
-      <div class="card" id="resultCard" hidden>
+      <div class="card" id="resultCard" data-testid="result" hidden>
         <div class="card-header">Result</div>
         <div class="card-body">
           <div class="note" id="resultInfo"></div>
-          <div class="row"><button class="btn btn-success" id="btnDownload">Download GLB</button></div>
+          <div class="row"><button class="btn btn-success" id="btnDownload" data-testid="download">Download GLB</button></div>
           <div class="note" id="resultHint" hidden>Every animation track is embedded in the one GLB as its own named animation. A meshopt-compressed GLB (EXT_meshopt_compression, KHR_mesh_quantization) loads in three.js, Babylon.js and model-viewer; untick <b>Meshopt compress</b> for plain glTF 2.0.</div>
         </div>
       </div>
@@ -168,7 +168,7 @@
   <div class="card">
     <div class="card-header">Privacy and limits</div>
     <div class="card-body">
-      <div class="note"><b>Zero egress.</b> Your character, motion and exported GLB never leave this device. Open DevTools, Network tab, and run a bake: only static files from this site are requested, and none after the first load once the service worker has cached them. The one exception is the optional <b>Try with the sample</b> button, which downloads the X Bot character from jsDelivr (a read-only GET; nothing is sent) and is cached afterwards.</div>
+      <div class="note"><b>Zero egress.</b> Your character, motion and exported GLB never leave this device. Open DevTools, Network tab, and run a bake: only static files from this site are requested, and none after the first load once the service worker has cached them. The one exception is the optional <b>Try with the sample</b> button, which downloads the X Bot character from jsDelivr (a read-only GET; nothing is sent) and is cached afterwards. This is a pure transform: it has no git, token, upload or versioning, and inputs given as <code>?character=&amp;motion=</code> URLs are fetched with a read-only GET.</div>
       <ul>
         <li>No foot-lock or IK yet: very short or long legged targets can slide.</li>
         <li>Swing-only alignment fixes direction, not roll: differing rest roll can twist forearms.</li>

@@ -140,9 +140,39 @@ The synonym table mapped every rig in the test set, so the app counts (locally, 
 
 Online retargeters and animation services upload your character and your capture data to a server. If those are unreleased game assets, a client's likeness, or research subjects, that upload is the problem. bodyrig-webCLI does the same retarget-and-export locally, deterministically, and you can prove nothing left the machine. Use a cloud tool when you need hand IK, cleanup, or non-humanoid rigs that this does not handle yet (see below).
 
+## Pure transform, agent-drivable
+
+bodyrig-webCLI is a **pure transform**: input (a URL or dropped files) in, artifact (a GLB download plus a grabbable handle) out. It has no git, no token, no repo write, no versioning and no file management. Versioning, pinning and persistence belong to the orchestrator driving it and to [Strata](https://github.com/tejaswigowda/strata-editor), never to this tool.
+
+**Input** is any fetchable URL (a CDN, jsDelivr or raw GitHub, S3, a `data:` URL, or a previous stage's output), or files dropped on the page. Parameters go in the query string or the `#fragment` (the fragment never reaches the server, so use it for long `data:` URLs):
+
+```
+index.html?character=<url>&motion=<url>[&motion=<url>...][&map=<url>][&args=--fps 24 --trim 2:10][&run=bake]
+```
+
+`owner/repo@ref:path` is optional sugar that expands to a jsDelivr URL, and a `raw.githubusercontent.com` URL that fails is retried once through jsDelivr. Neither is required. To pin an input, pass an immutable URL (jsDelivr `@<sha>`, content-addressed); the tool does not pin.
+
+**Output.** A **Download** button for people. For agents, `run=bake` starts without a click and, when finished, the page exposes:
+
+```js
+document.body.dataset.webcliStatus   // 'idle' | 'running' | 'done' | 'error'
+window.__webcli_result = { ok, op: 'bake', artifact: { mime: 'model/gltf-binary', name, size, dataUrl }, error, meta }
+```
+
+`dataUrl` is the GLB as a `data:` URL (built on first read); `error` is a message when `ok` is false. This is not a network write, only a way to retrieve the output. The same handle is set after a bake started by hand. Stable hooks for non-auto paths: `data-testid` `character-input`, `motion-input`, `bake`, `command`, `run`, `result`, `download`.
+
+```js
+// Playwright
+await page.goto(`${origin}/index.html?character=${a}&motion=${b}&run=bake`);
+await page.waitForSelector('body[data-webcli-status=done], body[data-webcli-status=error]');
+const { ok, artifact, error } = await page.evaluate(() => window.__webcli_result);
+```
+
+Identical immutable input URLs and arguments give byte-identical output. The live-stream path needs a human and a device; everything else, including a stock BVH, is headless. Persisting the GLB and feeding its URL to the next stage is the orchestrator's job.
+
 ## Verify zero egress
 
-Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled. The one exception, the sample button's download from jsDelivr, is tested separately with the CDN request intercepted, asserting it is exactly one `GET` to the pinned URL.
+Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled, and asserts that a `run=bake` from URLs is byte-identical on a second run. There is no write path to audit: no `POST` or `PUT`, no token. The one exception, the sample button's download from jsDelivr, is tested separately with the CDN request intercepted, asserting it is exactly one `GET` to the pinned URL.
 
 ## Testing (Playwright is the dev loop, not the product)
 
@@ -185,6 +215,7 @@ docs/                  the static PWA (GitHub Pages root)
   js/mocap-bake.mjs    deterministic engine (stages 2 to 6)
   js/loaders.js        stage 1       js/pipeline.js   stage 7, shared by GUI and tests
   js/command.js        raw command grammar, presets, examples
+  js/webcli.js         URL/file input resolver and ?run= parameters (read-only GET)
   js/live.js           stream recorder + resampler   js/ai.js   optional assist + host validator
   vendor/              three.js and the meshopt optimizer, built by scripts/vendor.mjs
 scripts/vendor.mjs     copies and minifies the vendored dependencies

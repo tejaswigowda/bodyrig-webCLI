@@ -283,6 +283,46 @@ try {
   await sc.close();
 } catch (e) { failures.push(`sample: ${e.message}`); }
 
+// ---- agent contract: run=bake from URLs, result handle, status attribute, determinism, error path ----
+try {
+  const drive = async (params, { timeout = 60000, hash = false } = {}) => {
+    const p = await ctx.newPage();
+    p.on('pageerror', e => pageErrors.push(`agent: ${e.message}`));
+    await p.goto(`${origin}/index.html?nosw${hash ? '#' : '&'}${new URLSearchParams(params)}`, { waitUntil: 'commit' });
+    await p.waitForSelector('body[data-webcli-status=done], body[data-webcli-status=error]', { timeout });
+    const res = await p.evaluate(() => window.__webcli_result);
+    const status = await p.getAttribute('body', 'data-webcli-status');
+    const dl = await p.isVisible('[data-testid=download]');
+    await p.close();
+    return { res, status, dl };
+  };
+  const q = { character: '/fixtures/ybot.fbx', motion: '/fixtures/mocap-33s.bvh', run: 'bake', args: '--trim 0:4 --fps 15' };
+  const a = await drive(q), b = await drive(q);
+  const bytesOf = r => Buffer.from(r.res.artifact.dataUrl.split(',')[1], 'base64');
+  check(a.status === 'done' && a.res.ok === true && a.res.op === 'bake' && a.res.error === null, `agent: bake did not finish ok: ${JSON.stringify(a.res).slice(0, 200)}`);
+  check(a.res.artifact.mime === 'model/gltf-binary' && /\.glb$/.test(a.res.artifact.name), 'agent: artifact mime or name wrong');
+  check(a.dl, 'agent: no Download button next to the handle');
+  const ab = bytesOf(a);
+  check(ab.subarray(0, 4).toString() === 'glTF' && ab.length === a.res.artifact.size, 'agent: artifact is not a GLB of the declared size');
+  check(ab.equals(bytesOf(b)), 'agent: identical inputs gave different bytes (not deterministic)');
+  console.log(`agent: run=bake from URLs -> ${Math.round(ab.length / 1024)} KB GLB, byte-identical on a second run`);
+
+  // data: URLs (a previous stage's output, no server needed) go in the #fragment: they are too long for a request line
+  const [bvhHead, bvhMotion] = bvhText.split('MOTION'), bvhRows = bvhMotion.split('\n').slice(3).filter(l => l.trim()).slice(0, 30);
+  const shortBvh = `${bvhHead}MOTION\nFrames: ${bvhRows.length}\nFrame Time: 0.033333\n${bvhRows.join('\n')}\n`;
+  const d = await drive({ character: '/fixtures/ybot.fbx', motion: `data:text/plain;base64,${Buffer.from(shortBvh).toString('base64')}`, run: 'bake', args: '--fps 15 --no-optimize' }, { hash: true });
+  check(d.status === 'done' && d.res.ok && d.res.artifact.dataUrl.startsWith('data:model/gltf-binary;base64,'), `agent: data: URL inputs failed: ${d.res?.error}`);
+
+  // a previous stage's output is a valid input: feed the baked GLB back as a motion source
+  const chain = await drive({ character: '/fixtures/ybot.fbx', motion: a.res.artifact.dataUrl, run: 'bake', args: '--fps 15 --no-optimize' }, { hash: true });
+  check(chain.status === 'done' && chain.res.ok, `agent: chaining a stage output as input failed: ${chain.res?.error}`);
+
+  const bad = await drive({ character: '/fixtures/ybot.fbx', motion: '/fixtures/does-not-exist.bvh', run: 'bake' });
+  check(bad.status === 'error' && bad.res.ok === false && bad.res.artifact === null && /404/.test(bad.res.error), `agent: bad input did not report an error: ${JSON.stringify(bad.res)}`);
+  const op = await drive({ run: 'push' });
+  check(op.status === 'error' && /Unknown run/.test(op.res.error), 'agent: unknown run= did not report an error');
+} catch (e) { failures.push(`agent: ${e.message}`); }
+
 // ---- zero egress: every request so far stayed on this origin, nothing carried a body ----
 const foreign = requests.filter(r => !r.url.startsWith(origin) && !/^(data|blob):/.test(r.url));
 check(!foreign.length, `egress: requests left the origin: ${foreign.slice(0, 3).map(r => r.url).join(', ')}`);

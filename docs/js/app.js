@@ -8,6 +8,7 @@ import { explainReport, groupUnmapped } from './advice.js';
 import { connectLive } from './live.js';
 import * as ai from './ai.js';
 import { SAMPLE_CHARACTERS } from './samples.js';
+import { parseRunParams, fetchInput } from './webcli.js';
 
 const $ = id => document.getElementById(id);
 const viewer = createViewer($('viewer'));
@@ -21,6 +22,19 @@ const state = {
   mapTrack: 0,                // which track the mapping panel shows
   map: {}, last: null, busy: false, live: null, ai: null,
 };
+
+// ---------- agent contract: data-webcli-status + window.__webcli_result (same shape across the family) ----------
+function webcliStatus(s) { document.body.setAttribute('data-webcli-status', s); if (s === 'running') window.__webcli_result = null; }
+function publishResult(r) {
+  const mime = 'model/gltf-binary';
+  let dataUrl; // built on first read: only agents need it
+  const artifact = { mime, name: r.name, size: r.glb.byteLength };
+  Object.defineProperty(artifact, 'dataUrl', { enumerable: true, get: () => (dataUrl ??= `data:${mime};base64,${bytesToBase64(r.glb)}`) });
+  const rep = r.report;
+  window.__webcli_result = { ok: true, op: 'bake', artifact, error: null, meta: { tracks: r.clips.map(c => c.name), frames: rep.frames, fps: rep.fps, mapped: rep.mapped, bones: rep.bones } };
+  webcliStatus('done');
+}
+webcliStatus('idle');
 
 // ---------- status + log ----------
 function setStatus(text, mode = 'ready') { $('statusText').textContent = text; $('dot').className = `dot ${mode}`; }
@@ -233,7 +247,11 @@ async function ingestFiles(list, role) {
   } catch (e) { fail(e); }
 }
 
-function fail(e) { log(`error: ${e.message || e}`, 'err'); setStatus(e.message || String(e), 'busy'); $('dot').className = 'dot'; console.error(e); }
+function fail(e) {
+  log(`error: ${e.message || e}`, 'err'); setStatus(e.message || String(e), 'busy'); $('dot').className = 'dot'; console.error(e);
+  window.__webcli_result = { ok: false, op: 'bake', artifact: null, error: String(e.message || e) };
+  webcliStatus('error');
+}
 
 function refreshButtons() {
   const ready = isReady();
@@ -405,7 +423,7 @@ async function bake(p) {
   applyMapFile(p.opts.mapFile);
   const manual = Object.keys(state.map).length;
   if (manual && !p.opts.mapFile) log(`note: ${manual} manual mapping override(s) active; save the map to reproduce this with --map`, 'dim');
-  state.busy = true; refreshButtons();
+  state.busy = true; refreshButtons(); webcliStatus('running');
   try {
     return await job(`Retargeting ${motions.length} track${motions.length > 1 ? 's' : ''}...`, async j => {
     const t = performance.now();
@@ -423,6 +441,7 @@ async function bake(p) {
     log(`baked ${name}: ${kb(res.glb.byteLength)}, ${res.clips.length} track(s), ${res.report.tracks.reduce((s, x) => s + x.frames, 0)} frames in ${fmtMs(performance.now() - t)}`, 'ok');
     setStatus(`Done: ${name} (${kb(res.glb.byteLength)}). Playing preview.`);
     $('btnPlay').disabled = false; $('scrub').disabled = false; viewer.play(); $('btnPlay').textContent = 'Pause';
+    publishResult(state.last);
     return state.last;
     });
   } finally { state.busy = false; refreshButtons(); }
@@ -557,6 +576,32 @@ window.bodyrigWebCLI = {
   b64: bytesToBase64,
   ai,
 };
+
+// ---------- run from the URL: inputs by GET, no click, result via the handle ----------
+async function autoRun(p) {
+  webcliStatus('running');
+  try {
+    const specs = [
+      ...(p.character ? [{ spec: p.character, role: 'model', name: 'character' }] : []),
+      ...p.motion.map((spec, i) => ({ spec, role: 'motion', name: `motion-${i + 1}` })),
+      ...(p.map ? [{ spec: p.map, role: undefined, name: 'map' }] : []),
+    ];
+    const inputs = await Promise.all(specs.map(s => fetchInput(s.spec, s.name)));
+    let mapName = null;
+    for (const [i, f] of inputs.entries()) {
+      const kind = await ingest(f.name, f.buf, specs[i].role);
+      if (kind === 'map') mapName = f.name;
+    }
+    if (p.map && !mapName) throw new Error('map= is not a bone map JSON.');
+    if (!p.run) { webcliStatus('idle'); setStatus(isReady() ? 'Ready.' : 'Inputs loaded.'); return; }
+    await executeRaw(['bake', mapName && `--map ${mapName}`, p.args].filter(Boolean).join(' '));
+  } catch (e) { fail(e); }
+}
+
+try {
+  const params = parseRunParams(location.search, location.hash);
+  if (params.requested) autoRun(params);
+} catch (e) { fail(e); }
 
 if (location.protocol.startsWith('http') && 'serviceWorker' in navigator && !new URLSearchParams(location.search).has('nosw')) {
   navigator.serviceWorker.register('service-worker.js').catch(() => {});
