@@ -1,6 +1,6 @@
 {
-  "name": "rig webCLI",
-  "short_name": "rig webCLI",
+  "name": "bodyrig-webCLI",
+  "short_name": "bodyrig-webCLI",
   "description": "Retarget BVH mocap onto any skinned character and export an animated GLB. 100% local.",
   "start_url": "./index.html",
   "scope": "./",

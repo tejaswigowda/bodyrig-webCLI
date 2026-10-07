@@ -47,6 +47,17 @@ details.card[open] > summary::after { content: '\25BE'; }
 .dot.ready { background: var(--success); }
 .dot.busy { background: var(--warn); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .25; } }
+.spinner { width: 14px; height: 14px; border: 2px solid var(--surface3); border-top-color: var(--accent-h); border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
+.spinner[hidden] { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.busybar { height: 4px; background: var(--surface3); border-radius: 2px; overflow: hidden; margin: -10px 0 16px; }
+.busybar[hidden] { display: none; }
+.busybar > div { height: 100%; background: var(--accent-h); }
+.busybar.indeterminate > div { width: 35%; animation: slide 1.1s ease-in-out infinite; }
+.busybar.determinate > div { transition: width .2s; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+.chip.busy { opacity: .75; }
+.chip .spinner { width: 12px; height: 12px; }
 #statusText { font-size: .82rem; color: var(--muted); }
 
 .drop-zone { border: 2px dashed var(--border); border-radius: var(--r); padding: 26px 16px; text-align: center; cursor: pointer; background: var(--surface2); transition: border-color .2s, background .2s; }

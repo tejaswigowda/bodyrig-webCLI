@@ -12,6 +12,9 @@ test('command: defaults and flags', () => {
   const p = parseCommand('bake --fps 60 --trim 2:10 --in-place --loop --map "my map.json" --no-optimize --max-tex 1024 --out a.glb');
   assert.deepEqual(p.opts, { ...DEFAULTS, fps: 60, trim: [2, 10], inPlace: true, loop: true, mapFile: 'my map.json', optimize: false, maxTex: 1024, out: 'a.glb' });
   assert.deepEqual(parseCommand('bake').opts, DEFAULTS);
+  assert.equal(parseCommand('bake --no-jpeg').opts.jpeg, false);
+  assert.equal(DEFAULTS.jpeg, true);
+  assert.equal(formatCommand({ jpeg: false }), 'bake --no-jpeg');
 });
 
 test('command: format round-trips through parse', () => {

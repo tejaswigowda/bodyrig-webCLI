@@ -28,5 +28,5 @@ export function createServer(dir = root, extra = {}) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const port = process.env.PORT || 8010;
-  createServer().listen(port, '127.0.0.1', () => console.log(`rig-webCLI at http://127.0.0.1:${port}`));
+  createServer().listen(port, '127.0.0.1', () => console.log(`bodyrig-webCLI at http://127.0.0.1:${port}`));
 }

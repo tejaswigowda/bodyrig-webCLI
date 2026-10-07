@@ -57,6 +57,18 @@ export function createViewer(host) {
     followSeen = false; time = 0; frame(); seek(0);
   }
 
+  function clearClips() {
+    if (mixer && model) { mixer.stopAllAction(); mixer.uncacheRoot(model); }
+    clips = []; clip = action = follow = null; playing = false; time = 0;
+    listeners.forEach(f => f(0));
+  }
+
+  function clear() {
+    clearClips();
+    if (model) scene.remove(model);
+    model = mixer = null;
+  }
+
   function seek(t) {
     time = Math.min(Math.max(t, 0), clip?.duration ?? 0);
     if (!mixer) return;
@@ -82,7 +94,7 @@ export function createViewer(host) {
   tick();
 
   return {
-    setModel, setClips, selectClip, seek, frame, canvas: renderer.domElement,
+    setModel, setClips, selectClip, clearClips, clear, seek, frame, canvas: renderer.domElement,
     play() { playing = !!clip; last = performance.now(); }, pause() { playing = false; },
     get playing() { return playing; }, get time() { return time; }, get duration() { return clip?.duration ?? 0; },
     setSpeed(s) { speed = s; },

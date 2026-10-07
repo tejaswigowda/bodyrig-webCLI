@@ -1,14 +1,14 @@
 // command.js -- the raw control surface. Pure functions (no DOM) so the GUI, the terminal box and tests share one grammar.
-//   bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--map FILE]
-//        [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--out NAME]
+//   bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock] [--map FILE]
+//        [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--out NAME]
 //   map  [--map FILE]        auto-map and print the mapping table
 //   inspect                  print the stage-by-stage report of the last bake
 //   help | clear
 
-export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, mapFile: null, optimize: true, level: 'medium', maxTex: 0, out: null };
+export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, mapFile: null, optimize: true, jpeg: true, level: 'medium', maxTex: 0, out: null };
 export const COMMANDS = ['bake', 'map', 'inspect', 'help', 'clear'];
 const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'level', 'max-tex', 'out']);
-const BOOL_FLAGS = new Set(['in-place', 'loop', 'no-align', 'optimize', 'no-optimize']);
+const BOOL_FLAGS = new Set(['in-place', 'loop', 'no-align', 'foot-lock', 'optimize', 'no-optimize', 'no-jpeg']);
 
 export function tokenize(line) {
   const out = []; const re = /"([^"]*)"|'([^']*)'|(\S+)/g; let m;
@@ -49,6 +49,8 @@ export function parseCommand(line) {
   if (flags['in-place']) opts.inPlace = true;
   if (flags.loop) opts.loop = true;
   if (flags['no-align']) opts.align = false;
+  if (flags['foot-lock']) opts.footLock = true;
+  if (flags['no-jpeg']) opts.jpeg = false;
   if (flags.map) opts.mapFile = flags.map;
   if (flags['no-optimize']) opts.optimize = false;
   if (flags.optimize) opts.optimize = true;
@@ -76,6 +78,8 @@ export function formatCommand(opts, { model, motions = [] } = {}) {
   if (o.inPlace) parts.push('--in-place');
   if (o.loop) parts.push('--loop');
   if (!o.align) parts.push('--no-align');
+  if (o.footLock) parts.push('--foot-lock');
+  if (!o.jpeg) parts.push('--no-jpeg');
   if (o.mapFile) parts.push('--map', q(o.mapFile));
   if (!o.optimize) parts.push('--no-optimize');
   else if (o.level !== DEFAULTS.level) parts.push('--level', o.level);
@@ -101,6 +105,7 @@ export const EXAMPLES = [
   { cmd: 'bake --no-optimize', note: 'Skip meshopt; the raw GLTFExporter output.' },
   { cmd: 'bake --level high --max-tex 2048', note: 'Stronger mesh compression, cap texture size.' },
   { cmd: 'bake --no-align', note: 'Skip reference-pose alignment (only for rigs already in the BVH rest pose).' },
+  { cmd: 'bake --foot-lock', note: 'Pin planted feet and bend the legs with two-bone IK; also keeps the hips at the right height.' },
   { cmd: 'bake --map map.json', note: 'Apply a saved bone map (drop it on the page or save one from the mapping panel).' },
   { cmd: 'map', note: 'Auto-map bones and print the table, including unmapped bones.' },
   { cmd: 'inspect', note: 'Show every pipeline stage of the last bake.' },
@@ -118,8 +123,10 @@ Flags for bake
   --in-place         remove horizontal root travel
   --loop             make the last frame equal the first
   --no-align         skip reference-pose alignment
+  --foot-lock        detect foot contacts, pin them and correct the legs with two-bone IK (not with --in-place)
   --map FILE         bone map JSON (dropped or saved in this page)
   --optimize / --no-optimize   meshopt compression (default on)
   --level medium|high          meshopt level
   --max-tex N        downscale textures to at most N px
+  --no-jpeg          keep every texture lossless PNG (default: textures without alpha are written as JPEG)
   --out NAME         output file name`;

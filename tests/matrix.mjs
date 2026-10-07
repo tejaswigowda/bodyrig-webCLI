@@ -33,6 +33,7 @@ const variants = [
   { id: 'default', line: 'bake', offset: 0, optimize: true, golden: true },
   { id: 'trim-inplace-24fps', line: 'bake --trim 2:10 --fps 24 --in-place', offset: 2, optimize: true, golden: true, expectDuration: 8 },
   { id: 'raw', line: 'bake --no-optimize', offset: 0, optimize: false },
+  { id: 'foot-lock', line: 'bake --no-optimize --foot-lock', offset: 0, optimize: false, lock: true },
 ];
 
 const failures = [], rows = [];
@@ -47,7 +48,7 @@ page.on('pageerror', e => pageErrors.push(e.message));
 page.on('console', m => { if (m.type() === 'error') pageErrors.push(m.text()); });
 ctx.on('request', r => requests.push({ url: r.url(), method: r.method(), body: r.postData() }));
 await page.goto(`${origin}/index.html?nosw`);
-await page.waitForFunction('window.rigWebCLI?.ready === true');
+await page.waitForFunction('window.bodyrigWebCLI?.ready === true');
 
 for (const ch of characters) for (const v of variants) {
   const job = `${ch.id}/${v.id}`;
@@ -55,9 +56,9 @@ for (const ch of characters) for (const v of variants) {
     const r = await page.evaluate(async ({ ch, v, bvh, src }) => {
       if (ch.synthetic) {
         const build = (0, eval)(`(${src})`);
-        return window.rigWebCLI.bakeObject(await build(), await (await fetch(bvh)).text(), v.line);
+        return window.bodyrigWebCLI.bakeObject(await build(), await (await fetch(bvh)).text(), v.line);
       }
-      return window.rigWebCLI.bakeUrls(ch.url, bvh, v.line);
+      return window.bodyrigWebCLI.bakeUrls(ch.url, bvh, v.line);
     }, { ch, v, bvh: `/fixtures/${BVH}`, src: buildSyntheticRig.toString() });
     const glb = Buffer.from(r.b64, 'base64');
     fs.writeFileSync(path.join(outDir, `${ch.id}.${v.id}.glb`), glb);
@@ -72,6 +73,15 @@ for (const ch of characters) for (const v of variants) {
     check(ver.meshopt === v.optimize, `${job}: expected meshopt=${v.optimize}, got ${ver.meshopt}`);
     if (v.optimize) check(r.glbBytes < (r.rawBytes ?? Infinity), `${job}: optimized GLB (${r.glbBytes}) not smaller than raw (${r.rawBytes})`);
     if (v.expectDuration) check(Math.abs(ver.animation.duration - v.expectDuration) < 0.1, `${job}: duration ${ver.animation.duration} != ${v.expectDuration}`);
+    if (v.lock) {
+      const fl = r.report.footLock;
+      check(fl?.applied, `${job}: foot lock not applied (${fl?.reason})`);
+      if (fl?.applied) {
+        check(fl.slideAfter < fl.slideBefore * 0.2, `${job}: planted feet still slide (${fl.slideBefore} -> ${fl.slideAfter})`);
+        check(fl.unreachableFrames < fl.correctedFrames * 0.2, `${job}: too many unreachable IK frames (${fl.unreachableFrames}/${fl.correctedFrames})`);
+        check(fl.hipShiftMax < 15, `${job}: hips moved ${fl.hipShiftMax} units to meet the floor`);
+      }
+    }
 
     if (v.golden && !ch.id.startsWith('local-')) {
       const gp = path.join(goldenDir, `${ch.id}.${v.id}.json`);
@@ -89,8 +99,10 @@ try {
   const uiErrors = []; ui.on('pageerror', e => uiErrors.push(e.message));
   await ui.setViewportSize({ width: 1400, height: 1000 });
   await ui.goto(`${origin}/index.html?nosw`);
+  const sawBar = ui.waitForSelector('#busyBar:not([hidden])', { timeout: 20000 }).then(() => true, () => false);
   await ui.setInputFiles('#modelInput', [path.join(fixtures, 'ybot.fbx')]);
-  await ui.waitForFunction(() => window.rigWebCLI.state.model);
+  check(await sawBar, 'ui: no progress bar while the character loaded');
+  await ui.waitForFunction(() => window.bodyrigWebCLI.state.model);
   check(!(await ui.locator('#resultCard').isVisible()), 'ui: baked before any animation track was added');
   await ui.setInputFiles('#motionInput', [path.join(fixtures, BVH)]);
   await ui.waitForSelector('#resultCard:not([hidden])', { timeout: 60000 });
@@ -99,7 +111,7 @@ try {
   check(await ui.locator('#trackSelect').isHidden(), 'ui: track selector shown for a single track');
   check((await ui.locator('.stage:not(.skipped)').count()) === 7, 'ui: not all seven stages reported');
   // playback: the pose must change with the scrubber and advance on its own
-  const pose = () => ui.evaluate(() => { let q; window.rigWebCLI.state.model.traverse(o => { if (o.isBone && /LeftUpLeg$/.test(o.name)) q = o.quaternion.toArray().map(x => +x.toFixed(4)).join(); }); return q; });
+  const pose = () => ui.evaluate(() => { let q; window.bodyrigWebCLI.state.model.traverse(o => { if (o.isBone && /LeftUpLeg$/.test(o.name)) q = o.quaternion.toArray().map(x => +x.toFixed(4)).join(); }); return q; });
   await ui.evaluate(() => { const s = document.getElementById('scrub'); s.value = 0; s.dispatchEvent(new Event('input')); });
   const p0 = await pose();
   await ui.evaluate(() => { const s = document.getElementById('scrub'); s.value = 500; s.dispatchEvent(new Event('input')); });
@@ -112,6 +124,10 @@ try {
   check((await ui.inputValue('#fps')) === '15', 'ui: command did not sync back to the fps control');
   await ui.fill('#cmd', 'bake --bogus'); await ui.click('#btnRun');
   check(/Unknown flag/.test(await ui.locator('#log').innerText()), 'ui: bad flag was not reported');
+  await ui.check('#footLock');
+  check((await ui.inputValue('#cmd')).includes('--foot-lock'), 'ui: the foot lock checkbox did not reach the command');
+  await ui.uncheck('#footLock');
+  check(!(await ui.inputValue('#cmd')).includes('--foot-lock'), 'ui: unchecking foot lock left the flag in the command');
   // mapping panel: pin Spine2 to the BVH Spine1 manually, save the map, and reuse it from the raw command
   await ui.selectOption('#mapBody tr:has-text("mixamorigSpine2") select', 'Spine1');
   check(await ui.locator('#mapBody tr.manual').count() === 1, 'ui: manual mapping row not flagged');
@@ -119,7 +135,7 @@ try {
   check((await ui.inputValue('#cmd')).includes('--map ybot.map.json'), 'ui: saving the map did not update the command');
   await ui.click('#btnRun');
   await ui.waitForFunction(() => (document.getElementById('log').textContent.match(/baked ybot_mocap-33s\.glb/g) || []).length >= 3, null, { timeout: 60000 }); // auto-bake, the 15 fps run, then this one
-  const savedMap = await ui.evaluate(() => window.rigWebCLI.state.files.get('ybot.map.json').map);
+  const savedMap = await ui.evaluate(() => window.bodyrigWebCLI.state.files.get('ybot.map.json').map);
   check(savedMap.Spine2 === 'Spine1' && savedMap.Hips === 'Hips', 'ui: saved map content wrong');
   await ui.fill('#cmd', 'map'); await ui.click('#btnRun');
   check(/\[manual\]/.test(await ui.locator('#log').innerText()), 'ui: map command did not list the manual override');
@@ -136,14 +152,22 @@ try {
   await ui.selectOption('#trackSelect', '1');
   check(await ui.evaluate(() => document.getElementById('time').textContent.includes('/ 8.00')), 'ui: switching track did not load the 8 s clip');
   await ui.locator('.chip:has-text("xbot.trim-inplace-24fps") .rm').click();
+  await ui.waitForSelector('#busyBar:not([hidden])', { timeout: 5000 }).catch(() => failures.push('ui: no progress bar while removing a track'));
+  await ui.waitForFunction(() => window.bodyrigWebCLI.state.motions.length === 1 && document.getElementById('busyBar').hidden, null, { timeout: 60000 });
   check((await ui.locator('.chip:has(.kind:text("track"))').count()) === 1, 'ui: removing a track chip did not remove the track');
+  check(await ui.locator('#trackSelect').isHidden() && !/tracks/.test(await ui.locator('#resultInfo').innerText()), 'ui: removing a track did not re-bake a single-track result');
+  // removing the character clears the preview and result
+  await ui.locator('.chip:has(.kind:text("character")) .rm').click();
+  await ui.waitForFunction(() => !window.bodyrigWebCLI.state.model && document.getElementById('busyBar').hidden, null, { timeout: 30000 });
+  check(await ui.locator('#resultCard').isHidden() && await ui.locator('#viewerEmpty').isVisible(), 'ui: removing the character left the result or preview behind');
+  check((await ui.locator('.chip:has(.kind:text("character"))').count()) === 0 && await ui.locator('#btnBake').isDisabled(), 'ui: character chip or Bake button not reset');
   check(!uiErrors.length, `ui: page errors: ${uiErrors.slice(0, 2).join(' | ')}`);
   await ui.close();
 } catch (e) { failures.push(`ui: ${e.message}`); }
 
 // ---- several animation tracks (BVH + a GLB animation) embedded as separate animations in one GLB ----
 try {
-  const r = await page.evaluate(() => window.rigWebCLI.bakeUrls('/fixtures/ybot.fbx', ['/fixtures/mocap-33s.bvh', '/out/xbot.trim-inplace-24fps.glb'], 'bake --no-optimize --trim 0:4 --fps 15'));
+  const r = await page.evaluate(() => window.bodyrigWebCLI.bakeUrls('/fixtures/ybot.fbx', ['/fixtures/mocap-33s.bvh', '/out/xbot.trim-inplace-24fps.glb'], 'bake --no-optimize --trim 0:4 --fps 15'));
   const glb = Buffer.from(r.b64, 'base64'); fs.writeFileSync(path.join(outDir, 'ybot.multitrack.glb'), glb);
   check(JSON.stringify(r.tracks) === JSON.stringify(['mocap-33s', 'xbot.trim-inplace-24fps']), `tracks: unexpected names ${r.tracks}`);
   const v0 = await verifyGLB(glb, bvhText, { clipIndex: 0 });
@@ -154,7 +178,7 @@ try {
   check(v0.meanLimbErrorDeg <= MAX_MEAN_DEG, `tracks: BVH track limb error ${v0.meanLimbErrorDeg}`);
   check(Object.keys(v1.limb).length >= 6 && v1.meanLimbErrorDeg <= MAX_MEAN_DEG, `tracks: GLB-source track limb error ${v1.meanLimbErrorDeg} (${Object.keys(v1.limb).length} segments)`);
   // asking for one file by name embeds only that file's track(s)
-  const one = await page.evaluate(() => window.rigWebCLI.execute('bake ybot.fbx xbot.trim-inplace-24fps.glb --no-optimize').then(x => x.clips.map(c => c.name)));
+  const one = await page.evaluate(() => window.bodyrigWebCLI.execute('bake ybot.fbx xbot.trim-inplace-24fps.glb --no-optimize').then(x => x.clips.map(c => c.name)));
   check(JSON.stringify(one) === JSON.stringify(['xbot.trim-inplace-24fps']), `tracks: named motion selected ${one}`);
   console.log(`tracks: ${r.tracks.join(' + ')} -> ${v0.animations.length} animations, limb error ${v0.meanLimbErrorDeg} / ${v1.meanLimbErrorDeg} deg`);
 } catch (e) { failures.push(`tracks: ${e.message}`); }
@@ -163,7 +187,7 @@ try {
 try {
   const r = await page.evaluate(async () => {
     const THREE = await import('/vendor/three/three.module.js');
-    const { settleAlphaModes } = await import('/js/pipeline.js');
+    const { settleAlphaModes, jpegOpaqueTextures } = await import('/js/pipeline.js');
     const cv = fn => { const c = document.createElement('canvas'); c.width = c.height = 64; fn(c.getContext('2d')); return new THREE.CanvasTexture(c); };
     const white = () => cv(g => { g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 64); });
     const half = () => cv(g => { g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 64); g.fillStyle = '#000'; g.fillRect(0, 0, 32, 64); });
@@ -172,13 +196,18 @@ try {
     const g = new THREE.Group(); for (const m of Object.values(mats)) g.add(new THREE.Mesh(new THREE.BufferGeometry(), m));
     const snap = () => Object.fromEntries(Object.entries(mats).map(([k, m]) => [k, { t: m.transparent, a: m.alphaTest, am: !!m.alphaMap }]));
     const s = settleAlphaModes(g), during = snap(); s.restore();
-    return { during, after: snap() };
+    const solid = white(), cut = half(); const jm = new THREE.Group();
+    jm.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ map: solid })), new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ map: cv(g => { g.fillStyle = 'rgba(255,255,255,0.3)'; g.fillRect(0, 0, 64, 64); }) })));
+    const j = jpegOpaqueTextures(jm); const jpegMimes = jm.children.map(c => c.material.map.userData.mimeType ?? null); j.restore();
+    return { during, after: snap(), jpegMimes, jpegAfter: jm.children.map(c => c.material.map.userData.mimeType ?? null), jpegCount: j.count };
   });
   check(!r.during.opaque.t && r.during.opaque.a === 0, `alpha: an opaque alpha map should export OPAQUE, got ${JSON.stringify(r.during.opaque)}`);
   check(!r.during.cutout.t && r.during.cutout.a === 0.5 && !r.during.cutout.am, `alpha: a cutout alpha map should export MASK with the map folded in, got ${JSON.stringify(r.during.cutout)}`);
   check(r.during.glass.t, 'alpha: real translucency (opacity 0.5) must stay BLEND');
   check(!r.during.plain.t, 'alpha: a textureless opacity-1 material should export OPAQUE');
   check(r.after.opaque.t && r.after.cutout.t && r.after.cutout.am && r.after.cutout.a === 0, 'alpha: live materials were not restored after export');
+  check(r.jpegMimes[0] === 'image/jpeg' && r.jpegMimes[1] === null && r.jpegCount === 1, `jpeg: opaque textures should go out as JPEG and translucent ones stay PNG, got ${JSON.stringify(r.jpegMimes)}`);
+  check(r.jpegAfter.every(m => m === null), 'jpeg: texture mime types were not restored after export');
 } catch (e) { failures.push(`alpha: ${e.message}`); }
 
 // ---- live stream: mock device -> record -> resample -> bake -> verify ----
@@ -195,15 +224,15 @@ try {
   await new Promise(r => wss.on('listening', r));
   const live = await ctx.newPage();
   await live.goto(`${origin}/index.html?nosw`);
-  await live.waitForFunction('window.rigWebCLI?.ready === true');
+  await live.waitForFunction('window.bodyrigWebCLI?.ready === true');
   await live.setInputFiles('#modelInput', [path.join(fixtures, 'xbot.fbx')]);
-  await live.waitForFunction(() => window.rigWebCLI.state.model);
+  await live.waitForFunction(() => window.bodyrigWebCLI.state.model);
   await live.locator('details:has(#liveUrl) > summary').click();
   await live.fill('#liveUrl', `ws://127.0.0.1:${wss.address().port}`);
   await live.click('#btnLiveConnect');
   await live.waitForFunction(() => /Recording: (\d+) frames/.test(document.getElementById('liveStatus').textContent) && +document.getElementById('liveStatus').textContent.match(/(\d+) frames/)[1] >= 80, null, { timeout: 20000 });
   await live.click('#btnLiveStop'); await live.click('#btnLiveUse');
-  const r = await live.evaluate(async () => { const x = await window.rigWebCLI.execute('bake --no-optimize'); const s = window.rigWebCLI.state; return { b64: window.rigWebCLI.b64(x.glb), bvh: s.motions[0].text, frames: x.report.frames }; });
+  const r = await live.evaluate(async () => { const x = await window.bodyrigWebCLI.execute('bake --no-optimize'); const s = window.bodyrigWebCLI.state; return { b64: window.bodyrigWebCLI.b64(x.glb), bvh: s.motions[0].text, frames: x.report.frames }; });
   const ver = await verifyGLB(Buffer.from(r.b64, 'base64'), r.bvh);
   check(ver.validator.errors === 0, 'live: validator errors');
   check(r.frames > 40, `live: only ${r.frames} frames baked`);
@@ -226,11 +255,11 @@ try {
   await off.goto(`${origin}/index.html`);
   await off.evaluate(async () => { await navigator.serviceWorker.ready; });
   await off.reload(); // now controlled by the worker
-  await off.waitForFunction('window.rigWebCLI?.ready === true');
-  await off.evaluate(() => window.rigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake')); // warms the runtime cache for the fixtures
+  await off.waitForFunction('window.bodyrigWebCLI?.ready === true');
+  await off.evaluate(() => window.bodyrigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake')); // warms the runtime cache for the fixtures
   await sw.setOffline(true);
-  await off.reload(); await off.waitForFunction('window.rigWebCLI?.ready === true');
-  const o = await off.evaluate(() => window.rigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake').then(r => ({ kb: r.glbBytes / 1024, frames: r.report.frames })));
+  await off.reload(); await off.waitForFunction('window.bodyrigWebCLI?.ready === true');
+  const o = await off.evaluate(() => window.bodyrigWebCLI.bakeUrls('/fixtures/xbot.fbx', '/fixtures/mocap-33s.bvh', 'bake').then(r => ({ kb: r.glbBytes / 1024, frames: r.report.frames })));
   check(o.frames > 900 && o.kb > 50, 'offline: bake failed or produced a tiny GLB');
   console.log(`offline: baked ${o.frames} frames to ${Math.round(o.kb)} KB with the network disabled`);
   await sw.close();

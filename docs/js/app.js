@@ -31,8 +31,33 @@ const fmtMs = ms => (ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(
 const baseName = n => n.replace(/\.[^.]+$/, '');
 const kb = b => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.round(b / 1024)} KB`);
 
+// ---------- progress: spinner + bar for every load, removal and bake ----------
+const jobs = new Set();
+const paint = () => new Promise(r => setTimeout(r, 30)); // lets the spinner paint before a long synchronous parse blocks the thread
+
+function renderBusy() {
+  const j = [...jobs].at(-1);
+  $('spinner').hidden = $('busyBar').hidden = !j;
+  document.body.setAttribute('aria-busy', j ? 'true' : 'false');
+  if (!j) return;
+  const known = j.fraction != null;
+  $('busyBar').className = `busybar ${known ? 'determinate' : 'indeterminate'}`;
+  $('busyFill').style.width = known ? `${Math.round(j.fraction * 100)}%` : '';
+  $('busyBar').setAttribute('aria-valuenow', known ? Math.round(j.fraction * 100) : '');
+  setStatus(j.label, 'busy');
+}
+
+// info.pending: { kind, name } shows a placeholder chip; info.removing: chip key (a track file or 'character') shown as being removed.
+async function job(label, fn, info = {}) {
+  const j = { label, fraction: null, ...info };
+  jobs.add(j); renderBusy(); renderChips(); refreshButtons(); await paint();
+  try { return await fn(j); } finally { jobs.delete(j); renderBusy(); renderChips(); refreshButtons(); }
+}
+
+function progress(j, fraction, label) { j.fraction = fraction; if (label) j.label = label; renderBusy(); }
+
 // ---------- options <-> UI <-> command ----------
-const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'level', 'inPlace', 'loop', 'align', 'optimize'];
+const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'level', 'inPlace', 'loop', 'align', 'footLock', 'optimize'];
 
 function readOpts() {
   const o = { ...state.opts };
@@ -41,7 +66,7 @@ function readOpts() {
   o.trim = s !== '' || e !== '' ? [s === '' ? 0 : +s, e === '' ? null : +e] : null;
   o.maxTex = Math.max(0, Math.round(+$('maxTex').value || 0));
   o.level = $('level').value;
-  for (const k of ['inPlace', 'loop', 'align', 'optimize']) o[k] = $(k).checked;
+  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize']) o[k] = $(k).checked;
   return o;
 }
 
@@ -52,7 +77,7 @@ function writeOpts(o) {
   $('trimEnd').value = state.opts.trim?.[1] ?? '';
   $('maxTex').value = state.opts.maxTex || '';
   $('level').value = state.opts.level;
-  for (const k of ['inPlace', 'loop', 'align', 'optimize']) $(k).checked = state.opts[k];
+  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize']) $(k).checked = state.opts[k];
   $('cmd').value = formatCommand(state.opts);
 }
 
@@ -77,16 +102,20 @@ const bvhHeaderText = () => state.motions.find(m => m.text)?.text ?? null;
 
 function renderChips() {
   const rows = [];
-  if (state.modelName) rows.push({ kind: 'character', name: state.modelName, meta: state.loadInfo });
-  for (const m of state.motions) rows.push({ kind: 'track', name: m.name, meta: m.info, file: m.file });
+  const removing = key => [...jobs].some(j => j.removing === key);
+  if (state.modelName) rows.push({ kind: 'character', name: state.modelName, meta: state.loadInfo, key: 'character', rm: true });
+  for (const m of state.motions) rows.push({ kind: 'track', name: m.name, meta: m.info, key: m.file, file: m.file, rm: true });
   for (const [n, f] of state.files) if (f.kind === 'map') rows.push({ kind: 'bone map', name: n, meta: `${Object.keys(f.map).length} entries` });
+  for (const j of jobs) if (j.pending) rows.push({ kind: j.pending.kind, name: j.pending.name, meta: 'loading...', busy: true });
   $('chips').replaceChildren(...rows.map(r => {
-    const d = document.createElement('div'); d.className = 'chip';
+    const busy = r.busy || removing(r.key);
+    const d = document.createElement('div'); d.className = `chip${busy ? ' busy' : ''}`;
     d.innerHTML = '<span class="kind"></span><span class="name"></span><span class="meta"></span>';
-    d.children[0].textContent = r.kind; d.children[1].textContent = r.name; d.children[2].textContent = r.meta ?? '';
-    if (r.file) {
-      const b = document.createElement('button'); b.className = 'rm'; b.textContent = '\u00d7'; b.title = `Remove ${r.file}`; b.setAttribute('aria-label', `Remove ${r.file}`);
-      b.onclick = () => { removeMotionFile(r.file); log(`removed ${r.file}`, 'dim'); };
+    d.children[0].textContent = r.kind; d.children[1].textContent = r.name; d.children[2].textContent = removing(r.key) ? 'removing...' : r.meta ?? '';
+    if (busy) { const s = document.createElement('span'); s.className = 'spinner'; d.appendChild(s); }
+    else if (r.rm) {
+      const b = document.createElement('button'); b.className = 'rm'; b.textContent = '\u00d7'; b.title = `Remove ${r.name}`; b.setAttribute('aria-label', `Remove ${r.name}`);
+      b.onclick = () => (r.file ? removeMotionFile(r.file) : removeCharacter());
       d.appendChild(b);
     }
     return d;
@@ -98,25 +127,55 @@ function renderChips() {
 }
 
 async function setModel(name, buf) {
-  setStatus(`Loading ${name}...`, 'busy');
-  const { model, dropped, ms } = await loadModel(buf, name);
-  const rig = normalizeRig(model); // also rejects un-rigged models early
-  state.models.set(name, buf);
-  state.model = model; state.modelName = name; state.rig = rig; state.map = {}; state.last = null;
-  state.opts.mapFile = null;
-  state.loadInfo = `${rig.bones.length} bones${dropped.length ? `, ${dropped.length} textures dropped` : ''}`;
-  state.modelLoadMs = ms; state.dropped = dropped;
-  rig.poseAll(); viewer.setModel(model); $('viewerEmpty').hidden = true;
-  log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+  await job(`Loading character ${name}...`, async () => {
+    const { model, dropped, ms } = await loadModel(buf, name);
+    const rig = normalizeRig(model); // also rejects un-rigged models early
+    state.models.set(name, buf);
+    state.model = model; state.modelName = name; state.rig = rig; state.map = {}; state.last = null;
+    state.opts.mapFile = null;
+    state.loadInfo = `${rig.bones.length} bones${dropped.length ? `, ${dropped.length} textures dropped` : ''}`;
+    state.modelLoadMs = ms; state.dropped = dropped;
+    rig.poseAll(); viewer.setModel(model); $('viewerEmpty').hidden = true;
+    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+  }, { pending: { kind: 'character', name } });
 }
 
 const describeSource = (s, dur) => `${s.bones.length} joints, ${dur.toFixed(1)} s`;
 
-function removeMotionFile(file) {
-  state.motions = state.motions.filter(m => m.file !== file);
-  state.mapTrack = Math.min(state.mapTrack, Math.max(0, state.motions.length - 1));
+function resetResult() {
   state.last = null;
-  renderChips(); renderMapping(); refreshButtons();
+  $('resultCard').hidden = true; $('trackSelect').hidden = true;
+  $('btnPlay').disabled = true; $('scrub').disabled = true; $('btnPlay').textContent = 'Play';
+  viewer.clearClips(); renderStages(null);
+}
+
+async function afterRemoval() {
+  if (isReady()) await execute('bake'); else { resetResult(); setStatus(state.model ? 'Add an animation track.' : 'Drop a character and at least one animation to begin.'); }
+}
+
+async function removeMotionFile(file) {
+  try {
+    await job(`Removing ${file}...`, async () => {
+      state.motions = state.motions.filter(m => m.file !== file);
+      state.mapTrack = Math.min(state.mapTrack, Math.max(0, state.motions.length - 1));
+      state.last = null; renderMapping();
+      log(`removed ${file}`, 'dim');
+    }, { removing: file });
+    await afterRemoval();
+  } catch (e) { fail(e); }
+}
+
+async function removeCharacter() {
+  try {
+    const name = state.modelName;
+    await job(`Removing ${name}...`, async () => {
+      state.models.delete(name);
+      state.model = state.rig = state.modelName = state.loadInfo = null; state.map = {}; state.opts.mapFile = null; state.dropped = [];
+      viewer.clear(); $('viewerEmpty').hidden = false; resetResult(); renderMapping();
+      log(`removed ${name}`, 'dim');
+    }, { removing: 'character' });
+    await afterRemoval();
+  } catch (e) { fail(e); }
 }
 
 function addBvhText(name, text) {
@@ -128,15 +187,16 @@ function addBvhText(name, text) {
 }
 
 async function addAnimationFile(name, buf) {
-  setStatus(`Loading ${name}...`, 'busy');
-  const { sources, ms } = await loadMotionFile(buf, name);
-  state.motions = state.motions.filter(m => m.file !== name);
-  sources.forEach((source, i) => state.motions.push({
-    file: name, ms: i ? 0 : ms, source, info: describeSource(source, source.clip.duration),
-    name: sources.length > 1 ? `${baseName(name)}_${source.clip.name || i + 1}` : baseName(name),
-  }));
-  state.last = null;
-  log(`loaded ${name}: ${sources.length} animation clip(s), ${sources[0].bones.length} joints`, 'dim');
+  await job(`Loading animation ${name}...`, async () => {
+    const { sources, ms } = await loadMotionFile(buf, name);
+    state.motions = state.motions.filter(m => m.file !== name);
+    sources.forEach((source, i) => state.motions.push({
+      file: name, ms: i ? 0 : ms, source, info: describeSource(source, source.clip.duration),
+      name: sources.length > 1 ? `${baseName(name)}_${source.clip.name || i + 1}` : baseName(name),
+    }));
+    state.last = null;
+    log(`loaded ${name}: ${sources.length} animation clip(s), ${sources[0].bones.length} joints`, 'dim');
+  }, { pending: { kind: 'track', name } });
 }
 
 function setMap(name, map) {
@@ -155,7 +215,7 @@ async function ingest(name, buf, role) {
     if (kind === 'map') { setMap(name, cleanMap(json)); renderChips(); renderMapping(); return kind; }
   }
   if (kind === 'model') await setModel(name, buf);
-  else if (/\.bvh$/i.test(name)) addBvhText(name, new TextDecoder().decode(buf));
+  else if (/\.bvh$/i.test(name)) await job(`Parsing ${name}...`, async () => addBvhText(name, new TextDecoder().decode(buf)), { pending: { kind: 'track', name } });
   else await addAnimationFile(name, buf);
   renderChips(); renderMapping(); refreshButtons();
   return kind;
@@ -177,6 +237,7 @@ function fail(e) { log(`error: ${e.message || e}`, 'err'); setStatus(e.message |
 function refreshButtons() {
   const ready = isReady();
   $('btnBake').disabled = !ready || state.busy;
+  $('btnBake').textContent = state.busy ? 'Baking...' : 'Bake & export GLB';
   $('btnAutoMap').disabled = !ready;
   $('btnSaveMap').disabled = !ready;
   $('btnLiveUse').disabled = !state.live || state.live.rec.frames.length < 2;
@@ -197,8 +258,7 @@ window.addEventListener('drop', e => { e.preventDefault(); ingestFiles(e.dataTra
 
 $('btnSample').onclick = async () => {
   try {
-    setStatus('Loading sample...', 'busy');
-    const [m, b] = await Promise.all(['samples/xbot.fbx', 'samples/mocap-33s.bvh'].map(u => fetch(u).then(r => { if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer(); })));
+    const [m, b] = await job('Fetching the sample...', () => Promise.all(['samples/xbot.fbx', 'samples/mocap-33s.bvh'].map(u => fetch(u).then(r => { if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer(); }))));
     await ingest('xbot.fbx', m, 'model'); await ingest('mocap-33s.bvh', b, 'motion');
     await execute('bake');
   } catch (e) { fail(e); }
@@ -343,10 +403,11 @@ async function bake(p) {
   applyMapFile(p.opts.mapFile);
   const manual = Object.keys(state.map).length;
   if (manual && !p.opts.mapFile) log(`note: ${manual} manual mapping override(s) active; save the map to reproduce this with --map`, 'dim');
-  state.busy = true; refreshButtons(); setStatus('Baking...', 'busy');
+  state.busy = true; refreshButtons();
   try {
+    return await job(`Retargeting ${motions.length} track${motions.length > 1 ? 's' : ''}...`, async j => {
     const t = performance.now();
-    const res = await runBake({ model: state.model, motions: motions.map(m => ({ name: m.name, source: m.source })), opts: p.opts, map: state.map });
+    const res = await runBake({ model: state.model, motions: motions.map(m => ({ name: m.name, source: m.source })), opts: p.opts, map: state.map, onProgress: (f, label) => progress(j, f, label) });
     const name = p.opts.out || `${baseName(state.modelName)}_${res.clips.length > 1 ? `${res.clips.length}-tracks` : res.clips[0].name}.glb`;
     state.last = { ...res, name, optimized: p.opts.optimize };
     const hip = state.model.getObjectByName(res.report.stages.find(s => s.n === 6).info.hip);
@@ -361,6 +422,7 @@ async function bake(p) {
     setStatus(`Done: ${name} (${kb(res.glb.byteLength)}). Playing preview.`);
     $('btnPlay').disabled = false; $('scrub').disabled = false; viewer.play(); $('btnPlay').textContent = 'Pause';
     return state.last;
+    });
   } finally { state.busy = false; refreshButtons(); }
 }
 
@@ -413,7 +475,7 @@ $('btnLiveUse').onclick = () => {
 };
 
 // ---------- zero-egress, locally measured stats (never sent) ----------
-const STATS_KEY = 'rig-webcli-stats';
+const STATS_KEY = 'bodyrig-webcli-stats';
 function recordStats(report) {
   const s = JSON.parse(localStorage.getItem(STATS_KEY) || '{"bakes":0,"missingCore":0}');
   s.bakes++; if (report.missingCore.length) s.missingCore++;
@@ -468,7 +530,7 @@ $('btnAiCmd').onclick = async () => {
 };
 
 // ---------- test/automation hook (Playwright drives the real page through this) ----------
-window.rigWebCLI = {
+window.bodyrigWebCLI = {
   ready: true,
   state,
   async bakeUrls(modelUrl, motionUrls, line = 'bake', mapUrl = null) {

@@ -1,5 +1,5 @@
 {
-  "name": "rig-webCLI",
+  "name": "bodyrig-webCLI",
   "version": "0.1.0",
   "description": "Client-side, offline mocap retargeting: skinned character + BVH in, animated web-optimized GLB out. Zero egress.",
   "type": "module",

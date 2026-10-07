@@ -135,7 +135,120 @@ export function analyzeMapping(tgt, sourceBones, override = {}) {
   return { ...m, findCore, missingCore, hips: hips && m.names[hips.name] ? hips : null };
 }
 
-export function bakeMocap(model, source, { fps = 30, map = {}, align = true, trim = null, inPlace = false, loop = false, name = 'mocap' } = {}) {
+// Foot lock + IK correction. Contacts are detected on the SOURCE feet (low and slow), then on the target:
+//  1. the hips are lifted or lowered so planted ankles sit at their rest height (no floating, no sinking),
+//  2. each contact's ankle is pinned to one spot, with a short blend in and out,
+//  3. a two-bone IK solve bends the leg to reach it, keeping the knee's bend side and the foot's world rotation.
+// The pelvis is not moved to help a leg reach, so a leg that is out of reach stays straight and the foot slips.
+function footLockPass({ n, fps, order, qv, pv, hipT, hipParentInv, hipParentScale, legs, srcFeet, srcLegLen, footRestY }) {
+  const sides = Object.keys(legs);
+  if (!sides.length) return { applied: false, reason: 'leg or foot bones are not mapped' };
+  const wq = o => o.getWorldQuaternion(new THREE.Quaternion()), wp = o => o.getWorldPosition(new THREE.Vector3());
+
+  const floor = (() => { const ys = sides.flatMap(s => srcFeet[s].map(p => p[1])).sort((a, b) => a - b); return ys[Math.floor(ys.length * 0.02)]; })();
+  const minRun = Math.max(2, Math.round(0.12 * fps)), ramp = Math.max(2, Math.round(0.1 * fps));
+  const contact = {}, segs = {};
+  for (const s of sides) {
+    const P = srcFeet[s], c = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)], span = (Math.min(n - 1, i + 1) - Math.max(0, i - 1)) / fps;
+      c[i] = P[i][1] - floor < 0.06 * srcLegLen && Math.hypot(b[0] - a[0], b[2] - a[2]) / span < 0.25 * srcLegLen ? 1 : 0;
+    }
+    const runs = v => { const r = []; for (let i = 0; i < n;) { let j = i; while (j < n && c[j] === v) j++; if (j > i) r.push([i, j - 1]); i = Math.max(j, i + 1); } return r; };
+    for (const [a, b] of runs(0)) if (a > 0 && b < n - 1 && b - a < 2) c.fill(1, a, b + 1); // close one-frame dropouts
+    for (const [a, b] of runs(1)) if (b - a + 1 < minRun) c.fill(0, a, b + 1);
+    contact[s] = c; segs[s] = runs(1);
+  }
+  const contactFrames = Object.fromEntries(sides.map(s => [s, contact[s].reduce((x, y) => x + y, 0)]));
+  if (!sides.some(s => segs[s].length)) return { applied: false, reason: 'no foot contacts detected', contactFrames };
+
+  const setFrame = i => { for (const b of order) b.quaternion.fromArray(qv.get(b), i * 4); hipT.position.fromArray(pv, i * 3); hipT.updateMatrixWorld(true); };
+  const ankleAt = i => { setFrame(i); return Object.fromEntries(sides.map(s => [s, wp(legs[s].foot)])); };
+
+  // 1. vertical: shift the hips so planted ankles stand at their rest height
+  const fk = Array.from({ length: n }, (_, i) => ankleAt(i));
+  const dy = new Float64Array(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    const on = sides.filter(s => contact[s][i]);
+    if (on.length) dy[i] = on.reduce((t, s) => t + footRestY[s] - fk[i][s].y, 0) / on.length;
+  }
+  const known = []; for (let i = 0; i < n; i++) if (!Number.isNaN(dy[i])) known.push(i);
+  for (let i = 0, k = 0; i < n; i++) {
+    if (!Number.isNaN(dy[i])) continue;
+    while (k < known.length && known[k] < i) k++;
+    const lo = known[k - 1], hi = known[k];
+    dy[i] = lo === undefined ? dy[hi] : hi === undefined ? dy[lo] : dy[lo] + (dy[hi] - dy[lo]) * (i - lo) / (hi - lo);
+  }
+  const sigma = Math.max(1, 0.1 * fps), half = Math.ceil(sigma * 3), smooth = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0, wsum = 0;
+    for (let k = -half; k <= half; k++) { const j = i + k; if (j < 0 || j >= n) continue; const w = Math.exp(-0.5 * (k / sigma) ** 2); sum += w * dy[j]; wsum += w; }
+    smooth[i] = sum / wsum;
+  }
+  const off = new THREE.Vector3(); let hipShiftMax = 0;
+  for (let i = 0; i < n; i++) {
+    off.set(0, smooth[i], 0).applyQuaternion(hipParentInv).divide(hipParentScale);
+    pv[i * 3] += off.x; pv[i * 3 + 1] += off.y; pv[i * 3 + 2] += off.z;
+    hipShiftMax = Math.max(hipShiftMax, Math.abs(smooth[i]));
+    for (const s of sides) fk[i][s].y += smooth[i];
+  }
+
+  // 2. anchors and blend weights
+  const anchor = {}, weight = {}, which = {};
+  for (const s of sides) {
+    anchor[s] = segs[s].map(([a, b]) => { let x = 0, z = 0; for (let i = a; i <= b; i++) { x += fk[i][s].x; z += fk[i][s].z; } return new THREE.Vector3(x / (b - a + 1), footRestY[s], z / (b - a + 1)); });
+    weight[s] = new Float32Array(n); which[s] = new Int32Array(n).fill(-1);
+    segs[s].forEach(([a, b], k) => {
+      for (let i = Math.max(0, a - ramp); i <= Math.min(n - 1, b + ramp); i++) {
+        const w = 1 - (i < a ? a - i : i > b ? i - b : 0) / (ramp + 1);
+        if (w > weight[s][i]) { weight[s][i] = w; which[s][i] = k; }
+      }
+    });
+  }
+
+  // 3. two-bone IK per frame
+  const solve = ({ up, knee, foot }, T) => {
+    const A = wp(up), B = wp(knee), C = wp(foot), qUp = wq(up), qKnee = wq(knee), qFoot = wq(foot);
+    const l1 = A.distanceTo(B), l2 = B.distanceTo(C), reach = l1 + l2 - 1e-4;
+    const dir = T.clone().sub(A), d = dir.length(); dir.divideScalar(d || 1);
+    const dc = Math.min(Math.max(d, Math.abs(l1 - l2) + 1e-4), reach);
+    const a = (l1 * l1 - l2 * l2 + dc * dc) / (2 * dc), h = Math.sqrt(Math.max(l1 * l1 - a * a, 0));
+    const pole = B.clone().sub(A); pole.addScaledVector(dir, -pole.dot(dir));
+    if (pole.lengthSq() < 1e-10) pole.set(0, 0, 1).addScaledVector(dir, -dir.z);
+    pole.normalize();
+    const K = A.clone().addScaledVector(dir, a).addScaledVector(pole, h), E = A.clone().addScaledVector(dir, dc);
+    const q1 = new THREE.Quaternion().setFromUnitVectors(B.clone().sub(A).normalize(), K.clone().sub(A).normalize());
+    const shin = C.clone().sub(B).applyQuaternion(q1).normalize();
+    const q2 = new THREE.Quaternion().setFromUnitVectors(shin, E.clone().sub(K).normalize());
+    const newUp = q1.clone().multiply(qUp), newKnee = q2.clone().multiply(q1).multiply(qKnee);
+    return { up: wq(up.parent).invert().multiply(newUp), knee: newUp.clone().invert().multiply(newKnee), foot: newKnee.clone().invert().multiply(qFoot), clamped: d > reach };
+  };
+  let unreachable = 0, corrected = 0, slideBefore = 0, slideAfter = 0, slideN = 0, slideMaxBefore = 0, slideMaxAfter = 0;
+  const T = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    if (!sides.some(s => weight[s][i] > 0)) continue;
+    setFrame(i);
+    for (const s of sides) {
+      const w = weight[s][i]; if (w <= 0) continue;
+      const A = anchor[s][which[s][i]], cur = fk[i][s];
+      T.copy(cur).lerp(A, w);
+      if (contact[s][i]) { const d = Math.hypot(cur.x - A.x, cur.z - A.z); slideBefore += d; slideMaxBefore = Math.max(slideMaxBefore, d); slideN++; }
+      const r = solve(legs[s], T);
+      if (r.clamped) unreachable++;
+      r.up.toArray(qv.get(legs[s].up), i * 4); r.knee.toArray(qv.get(legs[s].knee), i * 4); r.foot.toArray(qv.get(legs[s].foot), i * 4);
+      corrected++;
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (!sides.some(s => contact[s][i])) continue;
+    const now = ankleAt(i);
+    for (const s of sides) if (contact[s][i]) { const A = anchor[s][which[s][i]], d = Math.hypot(now[s].x - A.x, now[s].z - A.z); slideAfter += d; slideMaxAfter = Math.max(slideMaxAfter, d); }
+  }
+  const r2 = v => +v.toFixed(2);
+  return { applied: true, contactFrames, correctedFrames: corrected, unreachableFrames: unreachable, hipShiftMax: r2(hipShiftMax), slideBefore: r2(slideBefore / Math.max(1, slideN)), slideAfter: r2(slideAfter / Math.max(1, slideN)), slideMaxBefore: r2(slideMaxBefore), slideMaxAfter: r2(slideMaxAfter) };
+}
+
+export function bakeMocap(model, source, { fps = 30, map = {}, align = true, trim = null, inPlace = false, loop = false, footLock = false, name = 'mocap' } = {}) {
   const motion = source.skeleton ? motionFromBVH(source) : source;
   const stages = [];
   const stage = (n, name, info, t) => stages.push({ n, name, ms: +(performance.now() - t).toFixed(1), info });
@@ -165,6 +278,11 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   };
 
   rig.poseAll(); srcRoot.updateMatrixWorld(true);
+  const lockLegs = {}, srcFeetBones = {}, srcFeet = {}, footRestY = {}; // foot lock needs a full, mapped leg chain on both skeletons
+  if (footLock && !inPlace) for (const [s, pre] of [['L', 'Left'], ['R', 'Right']]) {
+    const up = findCore(`${pre}UpLeg`), knee = findCore(`${pre}Leg`), foot = findCore(`${pre}Foot`), sf = foot && srcMap.get(names[foot.name]);
+    if (up && knee && foot && sf && knee.parent === up && foot.parent === knee) { lockLegs[s] = { up, knee, foot }; srcFeetBones[s] = sf; srcFeet[s] = []; footRestY[s] = wp(foot).y; }
+  }
   const restL = new Map(order.map(b => [b, b.quaternion.clone()]));
   const swingDeg = {};
   if (align) { // swing each mapped bone so its direction matches the BVH rest direction (fixes A-pose/axis mismatch)
@@ -199,6 +317,7 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   const curW = new Map(), p0 = new THREE.Vector3(), hp = new THREE.Vector3();
   for (let i = 0; i < n; i++) {
     times[i] = i / fps; mixer.setTime(t0 + times[i]); srcRoot.updateMatrixWorld(true);
+    for (const s in srcFeet) srcFeet[s].push(wp(srcFeetBones[s]).toArray());
     for (const b of order) {
       const s = srcMap.get(names[b.name]);
       const pW = curW.get(b.parent) ?? wq(b.parent);
@@ -215,6 +334,13 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   stage(5, 'transfer rotations', { frames: n, window: [+t0.toFixed(3), +t1.toFixed(3)] }, t);
   t = performance.now();
 
+  let lock = null;
+  if (footLock) {
+    const srcLegLen = Object.keys(srcFeetBones).length ? wp(hipS).distanceTo(wp(Object.values(srcFeetBones)[0])) : 0;
+    lock = inPlace ? { applied: false, reason: 'in-place bakes keep the feet moving under a fixed body' }
+      : footLockPass({ n, fps, order, qv, pv, hipT, hipParentInv, hipParentScale, legs: lockLegs, srcFeet, srcLegLen, footRestY });
+  }
+
   if (loop) { // close the cycle: last pose == first pose
     for (const a of qv.values()) for (let k = 0; k < 4; k++) a[(n - 1) * 4 + k] = a[k];
     for (let k = 0; k < 3; k++) pv[(n - 1) * 3 + k] = pv[k];
@@ -225,10 +351,10 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
   tracks.push(new THREE.VectorKeyframeTrack(`${hipT.name}.position`, times, pv));
   rig.poseAll(); // leave the model in bind pose for export
   const clip = new THREE.AnimationClip(name, times[n - 1], tracks);
-  stage(6, 'root motion', { rootScale: +scale.toFixed(3), inPlace, loop, hip: hipT.name }, t);
+  stage(6, 'root motion', { rootScale: +scale.toFixed(3), inPlace, loop, hip: hipT.name, ...(lock && { footLock: lock }) }, t);
 
   return {
     clip,
-    report: { bones: tgt.length, skins: rig.skins, removedTwinBones: rig.removedTwinBones, mapped: Object.keys(names).length, unmapped, missingCore, mapping: rows, rootScale: +scale.toFixed(3), fps, frames: n, duration: +clip.duration.toFixed(3), stages },
+    report: { bones: tgt.length, skins: rig.skins, removedTwinBones: rig.removedTwinBones, mapped: Object.keys(names).length, unmapped, missingCore, mapping: rows, rootScale: +scale.toFixed(3), fps, frames: n, duration: +clip.duration.toFixed(3), footLock: lock, stages },
   };
 }

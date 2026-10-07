@@ -7,8 +7,8 @@
   <meta name="description" content="Retarget BVH, FBX and GLB animations onto any skinned character and export one animated, web-optimized GLB with every animation as its own track. 100% local: nothing leaves your browser.">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="rig webCLI">
-  <title>rig webCLI</title>
+  <meta name="apple-mobile-web-app-title" content="bodyrig-webCLI">
+  <title>bodyrig-webCLI</title>
   <link rel="manifest" href="manifest.json">
   <link rel="icon" type="image/svg+xml" href="icon.svg">
   <link rel="apple-touch-icon" href="icon.svg">
@@ -22,14 +22,15 @@
 </head>
 <body>
 <header>
-  <h1>rig webCLI</h1>
+  <h1>bodyrig-webCLI</h1>
   <span class="pill">mocap retargeting</span>
   <span class="badge-local" title="Verify in DevTools, Network tab">&#9679; 100% local &middot; zero egress</span>
-  <a class="gh-link" href="https://github.com/tejaswigowda/rig-webCLI" target="_blank" rel="noopener">GitHub</a>
+  <a class="gh-link" href="https://github.com/tejaswigowda/bodyrig-webCLI" target="_blank" rel="noopener">GitHub</a>
 </header>
 
 <div class="container">
-  <div class="statusbar"><span class="dot" id="dot"></span><span id="statusText">Drop a character and at least one animation to begin.</span></div>
+  <div class="statusbar"><span class="dot" id="dot"></span><span class="spinner" id="spinner" hidden></span><span id="statusText">Drop a character and at least one animation to begin.</span></div>
+  <div class="busybar indeterminate" id="busyBar" role="progressbar" aria-label="Processing" aria-valuemin="0" aria-valuemax="100" hidden><div id="busyFill"></div></div>
 
   <div class="layout">
     <!-- LEFT: inputs and the three levels of control -->
@@ -69,6 +70,7 @@
             <label><input type="checkbox" id="inPlace"> In place</label>
             <label><input type="checkbox" id="loop"> Loop (close cycle)</label>
             <label><input type="checkbox" id="align" checked> Align reference pose</label>
+            <label title="Pin planted feet and correct the legs with two-bone IK. Not used with In place."><input type="checkbox" id="footLock"> Foot lock + IK</label>
             <label><input type="checkbox" id="optimize" checked> Meshopt compress</label>
           </div>
           <button class="btn btn-primary btn-block" id="btnBake" disabled>Bake &amp; export GLB</button>
