@@ -77,6 +77,191 @@ export function motionsFromObject(object, animations) {
 // Rig normalization. FBXLoader (and rigs saved from it, e.g. Mesquite's rig.json) can nest a same-named
 // "twin" bone under each real bone, one set per skin. Collapse twins onto their parent, rebind every skin
 // to the shared bones, and treat the union of all skins' bones as one skeleton (multi-mesh characters).
+const topBone = b => { while (b.parent?.isBone) b = b.parent; return b; };
+// GLTFLoader renames repeated node names with a numeric suffix (pelvis, pelvis_1, pelvis_2); the case can differ too (root, Root).
+const dedupe = n => n.replace(/_\d+$/, '');
+const sameBone = (a, b) => { a = a.toLowerCase(); b = b.toLowerCase(); return a === b || a === dedupe(b) || dedupe(a) === b; };
+
+// Multi-armature exports (face / body / outfit meshes, each with its own copy of the skeleton, and each copy holding bones
+// the others lack, like a face rig with no fingers): fold every copy into the largest one. Bones are matched by hierarchy
+// and name; a bone with no counterpart is moved over (world pose kept), so the result is one skeleton with the union of
+// the bones. Skins are rebound onto it and the emptied copies are dropped. Copies whose root name differs are left alone.
+function mergeDuplicateSkeletons(skinned) {
+  const tops = new Set(); for (const sm of skinned) for (const b of sm.skeleton.bones) tops.add(topBone(b));
+  if (tops.size < 2) return 0;
+  const size = t => { let n = 0; t.traverse(o => { if (o.isBone) n++; }); return n; };
+  const [primary, ...copies] = [...tops].sort((a, b) => size(b) - size(a));
+  const world = new Map(); // bone world matrices before anything moves
+  for (const t of copies) t.traverse(o => { if (o.isBone) world.set(o, o.matrixWorld.clone()); });
+  const counterpart = new Map();
+  for (const t of copies) {
+    if (!sameBone(t.name, primary.name)) continue;
+    counterpart.set(t, primary);
+    const queue = [t];
+    while (queue.length) {
+      const d = queue.shift(), host = counterpart.get(d);
+      for (const c of [...d.children].filter(o => o.isBone)) {
+        const twin = host.children.find(o => o.isBone && o.name === c.name) ?? host.children.find(o => o.isBone && sameBone(o.name, c.name));
+        if (twin && twin !== c) counterpart.set(c, twin);
+        else { host.attach(c); counterpart.set(c, c); } // no counterpart: the bone joins the shared skeleton
+        queue.push(c);
+      }
+    }
+  }
+  const first = skinned[0]; first.updateWorldMatrix(true, false);
+  let root = primary; while (root.parent) root = root.parent; root.updateMatrixWorld(true);
+  for (const sm of skinned) {
+    const bs = sm.skeleton.bones, m = bs.map(b => counterpart.get(b) ?? b);
+    if (m.every((x, i) => x === bs[i])) continue;
+    // keep the bind pose: the shared bone must reproduce what the copy's bone did at rest
+    const inv = bs.map((b, i) => m[i].matrixWorld.clone().invert().multiply(world.get(b) ?? b.matrixWorld).multiply(sm.skeleton.boneInverses[i]));
+    sm.bind(new THREE.Skeleton(m, inv), sm.bindMatrix);
+  }
+  const used = new Set(); for (const sm of skinned) for (const b of sm.skeleton.bones) used.add(topBone(b));
+  let removed = 0;
+  for (const t of copies) if (counterpart.has(t) && !used.has(t)) { t.parent?.remove(t); removed++; }
+  return removed;
+}
+
+// Unskinned meshes shipped inside a skinned asset (hair cards, eyebrows) would stay behind when the body moves:
+// bind each one rigidly to the bone nearest its center. Meshes directly under the model root are left alone.
+function attachLooseMeshes(model, bones) {
+  const loose = [];
+  model.traverse(o => {
+    if (!o.isMesh || o.isSkinnedMesh || !o.parent || o.parent === model) return;
+    for (let p = o.parent; p; p = p.parent) if (p.isBone) return;
+    let skinned = false; o.parent.traverse(c => { if (c.isSkinnedMesh) skinned = true; });
+    if (skinned) loose.push(o);
+  });
+  if (!loose.length) return 0;
+  model.updateMatrixWorld(true);
+  const list = [...bones], pos = list.map(b => b.getWorldPosition(new THREE.Vector3())), c = new THREE.Vector3();
+  for (const m of loose) {
+    new THREE.Box3().setFromObject(m).getCenter(c);
+    let k = 0; for (let i = 1; i < list.length; i++) if (pos[i].distanceToSquared(c) < pos[k].distanceToSquared(c)) k = i;
+    list[k].attach(m);
+  }
+  return loose.length;
+}
+
+// Seam copies of one position (UV and normal splits) must share weights or the mesh tears along the seam as soon as it is
+// posed. Returns the copy groups whose weights disagree, out of all groups.
+function seamGroups(sm) {
+  const g = sm.geometry, pos = g.attributes.position, si = g.attributes.skinIndex, sw = g.attributes.skinWeight;
+  if (!pos || !si || !sw) return { total: 0, bad: [] };
+  g.computeBoundingBox();
+  const q = 1 / Math.max(g.boundingBox.getSize(new THREE.Vector3()).length() * 1e-6, 1e-12), groups = new Map();
+  for (let i = 0; i < pos.count; i++) {
+    const k = `${Math.round(pos.getX(i) * q)},${Math.round(pos.getY(i) * q)},${Math.round(pos.getZ(i) * q)}`, a = groups.get(k);
+    if (a) a.push(i); else groups.set(k, [i]);
+  }
+  const sig = i => { const s = []; for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > 0) s.push(`${si.getComponent(i, k)}:${sw.getComponent(i, k).toFixed(3)}`); return s.sort().join(); };
+  const copies = [...groups.values()].filter(ids => ids.length > 1);
+  return { total: copies.length, bad: copies.filter(ids => ids.some(i => sig(i) !== sig(ids[0]))) };
+}
+
+// Average the weights of each disagreeing seam group. Returns the number of vertices changed.
+function weldSeamWeights(sm, bad) {
+  const si = sm.geometry.attributes.skinIndex, sw = sm.geometry.attributes.skinWeight; let changed = 0;
+  for (const ids of bad) {
+    const acc = new Map();
+    for (const i of ids) for (let k = 0; k < 4; k++) { const w = sw.getComponent(i, k), j = si.getComponent(i, k); if (w > 0) acc.set(j, (acc.get(j) ?? 0) + w / ids.length); }
+    const top = [...acc].sort((a, b) => b[1] - a[1]).slice(0, 4), total = top.reduce((t, x) => t + x[1], 0);
+    for (const i of ids) for (let k = 0; k < 4; k++) { si.setComponent(i, k, top[k]?.[0] ?? 0); sw.setComponent(i, k, top[k] ? top[k][1] / total : 0); }
+    changed += ids.length;
+  }
+  if (changed) { si.needsUpdate = true; sw.needsUpdate = true; }
+  return changed;
+}
+
+// A mesh whose seam copies mostly disagree has noisy weights (it tears whenever it moves). Rebuild them the way a
+// "transfer weights" tool does: every vertex takes the weights of the nearest vertex of a clean skinned mesh (the body).
+function reskinFromClean(target, clean) {
+  const sources = clean.filter(c => c.bindMatrix.equals(target.bindMatrix));
+  if (!sources.length) return false;
+  target.updateWorldMatrix(true, false); sources.forEach(c => c.updateWorldMatrix(true, false));
+  const tg = target.geometry, tpos = tg.attributes.position, v = new THREE.Vector3();
+  const box = new THREE.Box3(); for (const c of sources) box.expandByObject(c);
+  const cell = Math.max(box.getSize(v).length() / 50, 1e-9);
+  const pts = [], dom = []; // pts: flat [x, y, z, sourceIndex, vertexIndex]; dom: each source vertex's strongest bone
+  const grid = new Map(), key = (x, y, z) => ((x + 1024) * 4096 + (y + 1024)) * 4096 + (z + 1024);
+  sources.forEach((c, si) => {
+    const p = c.geometry.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      v.fromBufferAttribute(p, i).applyMatrix4(c.matrixWorld);
+      const k = key(Math.floor(v.x / cell), Math.floor(v.y / cell), Math.floor(v.z / cell)), n = pts.length / 5;
+      pts.push(v.x, v.y, v.z, si, i);
+      const ws = c.geometry.attributes.skinWeight, ji = c.geometry.attributes.skinIndex; let top = 0;
+      for (let k = 1; k < 4; k++) if (ws.getComponent(i, k) > ws.getComponent(i, top)) top = k;
+      dom.push(c.skeleton.bones[ji.getComponent(i, top)]);
+      const a = grid.get(k); if (a) a.push(n); else grid.set(k, [n]);
+    }
+  });
+  // A hand or forearm resting at the hip is nearer to a hem vertex than the torso is. A vertex that the garment itself does
+  // not weight to any arm bone must not take its weights from one.
+  const armMemo = new Map();
+  const inArm = b => { let r = armMemo.get(b); if (r === undefined) { r = false; for (let x = b; x?.isBone; x = x.parent) if (/^(Left|Right)Arm$/.test(canonical(x.name))) { r = true; break; } armMemo.set(b, r); } return r; };
+  const bones = [], inverses = [], slot = new Map();
+  const index = (c, j) => {
+    const b = c.skeleton.bones[j]; let s = slot.get(b);
+    if (s === undefined) { s = bones.length; slot.set(b, s); bones.push(b); inverses.push(c.skeleton.boneInverses[j]); }
+    return s;
+  };
+  const maps = new Array(tpos.count);
+  for (let i = 0; i < tpos.count; i++) {
+    v.fromBufferAttribute(tpos, i).applyMatrix4(target.matrixWorld);
+    const cx = Math.floor(v.x / cell), cy = Math.floor(v.y / cell), cz = Math.floor(v.z / cell);
+    let armish = false; { const si = tg.attributes.skinIndex, sw = tg.attributes.skinWeight; for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > 0.05 && inArm(target.skeleton.bones[si.getComponent(i, k)])) armish = true; }
+    let best = -1, bd = Infinity, any = -1, ad = Infinity;
+    const visit = (x, y, z) => {
+      for (const n of grid.get(key(x, y, z)) ?? []) {
+        const d = (pts[n * 5] - v.x) ** 2 + (pts[n * 5 + 1] - v.y) ** 2 + (pts[n * 5 + 2] - v.z) ** 2;
+        if (d < ad) { ad = d; any = n; }
+        if (d < bd && (armish || !inArm(dom[n]))) { bd = d; best = n; }
+      }
+    };
+    // grow cube shells around the vertex's cell until no unseen cell can hold a nearer point
+    for (let r = 0; r < 50 && (best < 0 || (r - 1) * cell < Math.sqrt(bd)); r++) {
+      for (let x = cx - r; x <= cx + r; x++) for (let y = cy - r; y <= cy + r; y++) {
+        if (Math.abs(x - cx) === r || Math.abs(y - cy) === r) for (let z = cz - r; z <= cz + r; z++) visit(x, y, z);
+        else { visit(x, y, cz - r); if (r) visit(x, y, cz + r); }
+      }
+    }
+    if (best < 0) best = any;
+    if (best < 0) return false;
+    const c = sources[pts[best * 5 + 3]], vi = pts[best * 5 + 4], si = c.geometry.attributes.skinIndex, sw = c.geometry.attributes.skinWeight, m = new Map();
+    for (let k = 0; k < 4; k++) { const w = sw.getComponent(vi, k); if (w > 0) { const j = index(c, si.getComponent(vi, k)); m.set(j, (m.get(j) ?? 0) + w); } }
+    maps[i] = m;
+  }
+  // The nearest vertex flips between body parts across a loose garment (hem, between the legs); blend over the mesh to calm it.
+  const gid = new Int32Array(tpos.count), ids = new Map();
+  for (let i = 0; i < tpos.count; i++) {
+    const k = `${Math.round(tpos.getX(i) * 1e5)},${Math.round(tpos.getY(i) * 1e5)},${Math.round(tpos.getZ(i) * 1e5)}`;
+    if (!ids.has(k)) ids.set(k, ids.size); gid[i] = ids.get(k);
+  }
+  const adj = Array.from({ length: ids.size }, () => new Set()), ti = tg.index, tris = ti ? ti.count : tpos.count;
+  for (let t = 0; t < tris; t += 3) {
+    const a = gid[ti ? ti.getX(t) : t], b = gid[ti ? ti.getX(t + 1) : t + 1], c = gid[ti ? ti.getX(t + 2) : t + 2];
+    adj[a].add(b).add(c); adj[b].add(a).add(c); adj[c].add(a).add(b);
+  }
+  let cur = new Array(ids.size); for (let i = 0; i < tpos.count; i++) cur[gid[i]] = maps[i];
+  for (let it = 0; it < 4; it++) {
+    cur = cur.map((m, g) => {
+      const acc = new Map(), n = adj[g].size || 1;
+      for (const [j, w] of m) acc.set(j, w * 0.4);
+      for (const h of adj[g]) for (const [j, w] of cur[h]) acc.set(j, (acc.get(j) ?? 0) + 0.6 * w / n);
+      const top = [...acc].sort((x, y) => y[1] - x[1]).slice(0, 4), total = top.reduce((t, x) => t + x[1], 0);
+      return new Map(top.map(([j, w]) => [j, w / total]));
+    });
+  }
+  const idx = new Uint16Array(tpos.count * 4), wts = new Float32Array(tpos.count * 4);
+  for (let i = 0; i < tpos.count; i++) [...cur[gid[i]]].forEach(([j, w], k) => { idx[i * 4 + k] = j; wts[i * 4 + k] = w; });
+  tg.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(idx, 4));
+  tg.setAttribute('skinWeight', new THREE.Float32BufferAttribute(wts, 4));
+  target.bind(new THREE.Skeleton(bones, inverses), target.bindMatrix);
+  return true;
+}
+
 export function normalizeRig(model) {
   const skinned = []; model.traverse(o => { if (o.isSkinnedMesh) skinned.push(o); });
   if (!skinned.length) throw new Error('No SkinnedMesh found -- the model is not rigged.');
@@ -86,6 +271,16 @@ export function normalizeRig(model) {
   for (const sm of skinned) {
     const mapped = sm.skeleton.bones.map(real);
     if (mapped.some((b, i) => b !== sm.skeleton.bones[i])) sm.bind(new THREE.Skeleton(mapped), sm.bindMatrix);
+  }
+  const mergedSkeletons = mergeDuplicateSkeletons(skinned);
+  const seams = new Map(skinned.map(sm => [sm, seamGroups(sm)]));
+  const noisy = sm => { const s = seams.get(sm); return s.total >= 20 && s.bad.length / s.total > 0.2; };
+  const clean = skinned.filter(sm => seams.get(sm).total && !seams.get(sm).bad.length);
+  let weldedSeamVertices = 0, reskinnedMeshes = 0;
+  for (const sm of skinned) {
+    if (!seams.get(sm).bad.length) continue;
+    if (noisy(sm) && reskinFromClean(sm, clean)) reskinnedMeshes++;
+    else weldedSeamVertices += weldSeamWeights(sm, seams.get(sm).bad);
   }
   // glTF requires skin.skeleton (exported as bones[0]) to be a common root of all joints. Partial skins
   // (e.g. a "Body" mesh weighted from Spine2 up) violate that: move/insert the top root at index 0.
@@ -105,7 +300,8 @@ export function normalizeRig(model) {
   // include unskinned bones on the chain between skinned ones (e.g. a Spine1 no mesh weights to)
   for (const b of [...bones]) for (let p = b.parent; p?.isBone; p = p.parent) bones.add(p);
   const poseAll = () => { for (const sm of skinned) sm.skeleton.pose(); model.updateMatrixWorld(true); };
-  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed };
+  const attachedMeshes = attachLooseMeshes(model, bones);
+  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed, mergedSkeletons, weldedSeamVertices, reskinnedMeshes, attachedMeshes };
 }
 
 // `override` maps a target bone's canonical name -> source bone name; an empty string pins the bone to rest pose.
@@ -262,7 +458,7 @@ export function bakeMocap(model, source, { fps = 30, map = {}, align = true, tri
 
   const rig = normalizeRig(model);
   const tgt = rig.bones;
-  stage(2, 'normalize rig', { bones: tgt.length, skins: rig.skins, removedTwinBones: rig.removedTwinBones }, t);
+  stage(2, 'normalize rig', { bones: tgt.length, skins: rig.skins, removedTwinBones: rig.removedTwinBones, mergedSkeletons: rig.mergedSkeletons }, t);
 
   t = performance.now();
   const { names, rows, unmapped, findCore, missingCore, hips: hipT } = analyzeMapping(tgt, motion.bones, map);

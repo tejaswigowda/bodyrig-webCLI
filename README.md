@@ -81,8 +81,8 @@ Retargeting is geometry with a right answer, so the core pipeline is 100% determ
 
 `docs/js/mocap-bake.mjs` is a reusable, dependency-light engine (only three.js). Stages 2 to 6 live there; stages 1 and 7 are in `loaders.js` and `pipeline.js`.
 
-1. **Load.** FBXLoader / GLTFLoader / ObjectLoader for the model, BVHLoader for BVH motion, and FBXLoader / GLTFLoader again for FBX and GLB animation files. Textures are awaited so they can be re-encoded on export; textures that never resolve are dropped instead of failing the export.
-2. **Normalize rig.** Collapse FBX "twin" bones, rebind skins to one shared skeleton, put a common root at joint 0 (a glTF requirement).
+1. **Load.** FBXLoader / GLTFLoader / ObjectLoader for the model (Draco- and meshopt-compressed GLBs decode with vendored same-origin decoders), BVHLoader for BVH motion, and FBXLoader / GLTFLoader again for FBX and GLB animation files. Textures are awaited so they can be re-encoded on export; textures that never resolve are dropped instead of failing the export.
+2. **Normalize rig.** Collapse FBX "twin" bones, rebind skins to one shared skeleton, put a common root at joint 0 (a glTF requirement). Exports with one armature per mesh (face, body and outfit each carrying a renamed copy of the skeleton, as in MetaHuman-style GLBs) are folded into the largest copy: bones are matched by hierarchy and name (`pelvis_1` is `pelvis`), bones only a copy has are moved over, and every skin is rebound with its bind pose kept. Unskinned meshes inside a skinned asset (hair cards, eyebrows) are bound rigidly to the nearest bone so they follow the body.
 3. **Map bones.** Canonicalize names (`mixamorig`, `mm`, `Actor:` namespaces, VRoid `J_Bip_*`, UE and Rigify styles), resolve through a synonym table. Unmapped bones hold the rest pose. When several bones share a canonical name (VRM has both `Root` and `J_Bip_C_Hips` for Hips) only the deepest is mapped, so the real hips carry the motion and the root stays put.
 4. **Align reference pose.** First the facing is matched: the left/right hips (or arms) give the yaw between the character and the source, and every source rotation and the root path are carried across by it, so a character that faces -Z (VRM 0.x) walks forwards instead of backwards; the detected yaw is in the stage 4 report. Then each mapped bone is swung so its direction matches the BVH rest direction, across unmapped intermediate bones. This is what makes A-poses and non-Mixamo axes work, and what the naive local-quaternion copy cannot do.
 5. **Transfer rotations.** World-delta transfer with sign-continuous quaternions.
@@ -93,7 +93,7 @@ Retargeting is geometry with a right answer, so the core pipeline is 100% determ
 
 ```
 bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock]
-     [--map FILE] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--out NAME]
+     [--map FILE] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
 map  [--map FILE]     auto-map bones and print the table
 inspect               stage-by-stage report of the last bake
 help | clear
@@ -102,6 +102,7 @@ help | clear
 - `bake` with no file names uses the loaded character and every loaded track. Name a character and some motion files (`bake hero.glb walk.bvh run.fbx`) to embed only those.
 - `--trim 2:10`, `2:` and `:10` are all valid (seconds).
 - `--loop` makes the last frame equal the first; root travel resets unless combined with `--in-place`.
+- `--hide Outfits` leaves out every mesh whose name, or a parent group's name, contains `Outfits` (case-insensitive; separate several names with commas). It applies to the preview and the exported GLB, and the log says how many meshes matched. Use it to bake the bare body and add your own clothing afterwards.
 - `--foot-lock` pins planted feet and corrects the legs with two-bone IK; it is ignored with `--in-place` (the report says why).
 - `--map FILE` takes a flat `{ "Canonical": "BVH bone" }` JSON file. Drop it on the page, or use **Save map** in the mapping panel (it registers itself, and the command updates to include `--map`). An empty string pins a bone to its rest pose.
 - Typing in the command box updates the controls and vice versa; the command is always the source of truth.
@@ -198,6 +199,7 @@ Meshopt numbers depend on the texture content. A 3-texture Mixamo character (50 
 ## Honest limitations
 
 - Foot lock moves the legs only, never the pelvis, to meet a pinned foot. Where the pinned ankle is out of reach (about 6% of frames on the fixtures) the leg straightens and the foot slips instead of the hips dropping. Contact detection is a height and speed heuristic on the source ankles and assumes a flat floor and a Y-up source; it is skipped with `--in-place`, and with no mapped leg chain. Arms (hand planting) are not corrected.
+- Retargeting moves bones; it does not author skin weights. Duplicate vertices at one position (UV and normal seams) must share weights or a mesh tears along the seam. Where they disagree the weights are averaged, and a mesh where most seams disagree (a MetaHuman-style outfit export was like this) is re-skinned from the nearest vertices of a clean mesh on the same skeleton (the body) and smoothed, so tight clothing follows the body. A garment vertex the file does not weight to any arm bone never takes its weights from an arm, so hands resting at the hips do not drag the hem. The load log says when this happened. Loose garments can still flare at the hem in extreme poses, as any linear-blend skin does.
 - Swing-only alignment fixes direction but not roll. Rigs whose rest roll differs from the BVH can twist forearms; a roll-match step or per-bone offset would cover it.
 - Bones the BVH has no counterpart for (for example a Mixamo `Spine2` against a BVH without it) hold their rest pose relative to their parent; the chain direction is still aligned through them.
 - FBXLoader is the least predictable stage (twin bones, units, external textures). GLB input is cleaner and recommended.

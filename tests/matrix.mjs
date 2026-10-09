@@ -6,6 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { WebSocketServer } from 'ws';
+import draco3d from 'draco3dgltf';
+import { NodeIO } from '@gltf-transform/core';
+import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
+import { draco } from '@gltf-transform/functions';
 import { createServer } from '../server.js';
 import { ensureFixtures } from './fetch-fixtures.mjs';
 import { SAMPLE_CHARACTERS } from '../docs/js/samples.js';
@@ -271,6 +275,17 @@ try {
   await live.close(); wss.close();
 } catch (e) { failures.push(`live: ${e.message}`); }
 
+// ---- one multi-select in the animation box: the T-pose FBX (a one-frame clip, no motion) must become the character ----
+try {
+  const mp = await ctx.newPage(); await mp.goto(`${origin}/index.html?nosw`);
+  await mp.waitForFunction('window.bodyrigWebCLI?.ready === true');
+  await mp.setInputFiles('#motionInput', [path.join(fixtures, 'xbot.fbx'), path.join(fixtures, BVH)]);
+  await mp.waitForSelector('body[data-webcli-status=done], body[data-webcli-status=error]', { timeout: 60000 });
+  const res = await mp.evaluate(() => window.__webcli_result);
+  check(res?.ok === true && await mp.evaluate(() => window.bodyrigWebCLI.state.modelName) === 'xbot.fbx', `animation box: character FBX was not used as the character (${res?.error})`);
+  await mp.close();
+} catch (e) { failures.push(`animation box: ${e.message}`); }
+
 // ---- sample button: X Bot comes from the CDN (stubbed with the verified local copy), the BVH from this origin ----
 try {
   const sc = await browser.newContext({ serviceWorkers: 'block' }), seen = [];
@@ -321,6 +336,21 @@ try {
   check(bad.status === 'error' && bad.res.ok === false && bad.res.artifact === null && /404/.test(bad.res.error), `agent: bad input did not report an error: ${JSON.stringify(bad.res)}`);
   const op = await drive({ run: 'push' });
   check(op.status === 'error' && /Unknown run/.test(op.res.error), 'agent: unknown run= did not report an error');
+
+  // Draco-compressed character: decodes through the vendored same-origin decoder
+  const io = new NodeIO().registerExtensions(ALL_EXTENSIONS).registerDependencies({ 'draco3d.encoder': await draco3d.createEncoderModule(), 'draco3d.decoder': await draco3d.createDecoderModule() });
+  const dDoc = await io.readBinary(new Uint8Array(fs.readFileSync(path.join(outDir, 'synthetic-blender.raw.glb'))));
+  await dDoc.transform(draco());
+  fs.writeFileSync(path.join(outDir, 'synthetic-draco.glb'), await io.writeBinary(dDoc));
+  check(dDoc.getRoot().listExtensionsUsed().some(e => e.extensionName === 'KHR_draco_mesh_compression'), 'draco: fixture is not Draco-compressed');
+  const dracoPage = await ctx.newPage(), dracoMsgs = [];
+  dracoPage.on('console', m => dracoMsgs.push(m.text()));
+  await dracoPage.goto(`${origin}/index.html?nosw&${new URLSearchParams({ character: '/out/synthetic-draco.glb', motion: `/fixtures/${BVH}`, run: 'bake', args: '--no-optimize --trim 0:2 --fps 15' })}`, { waitUntil: 'commit' });
+  await dracoPage.waitForSelector('body[data-webcli-status=done], body[data-webcli-status=error]', { timeout: 60000 });
+  const dr = await dracoPage.evaluate(() => window.__webcli_result);
+  check(dr.ok === true, `draco: bake failed: ${dr.error}`);
+  check(!dracoMsgs.some(t => /DRACOLoader/.test(t)), 'draco: loader warned about a missing DRACOLoader');
+  await dracoPage.close();
 } catch (e) { failures.push(`agent: ${e.message}`); }
 
 // ---- zero egress: every request so far stayed on this origin, nothing carried a body ----

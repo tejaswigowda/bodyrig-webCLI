@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { parseBVH, motionFromBVH, motionsFromObject } from './mocap-bake.mjs';
 
@@ -39,6 +40,10 @@ function dropUnresolvedTextures(model) {
   return dropped;
 }
 
+// Draco-compressed GLBs decode with the vendored same-origin decoder, so no third-party request is made.
+let draco;
+const dracoLoader = () => (draco ??= new DRACOLoader().setDecoderPath(new URL('../vendor/three/addons/libs/draco/gltf/', import.meta.url).href));
+
 export async function loadModel(buf, name) {
   const t0 = performance.now();
   let settle; const done = new Promise(r => { settle = r; });
@@ -49,7 +54,7 @@ export async function loadModel(buf, name) {
   else if (/\.json$/i.test(name)) {
     const json = JSON.parse(new TextDecoder().decode(buf));
     model = await new THREE.ObjectLoader().parseAsync(json.scene ?? json);
-  } else { const gltf = await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).parseAsync(buf, ''); model = gltf.scene; animations = gltf.animations; }
+  } else { const gltf = await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).setDRACOLoader(dracoLoader()).parseAsync(buf, ''); model = gltf.scene; animations = gltf.animations; }
   await Promise.race([done, new Promise(r => setTimeout(r, 20000))]);
   const dropped = dropUnresolvedTextures(model);
   return { model, animations, dropped, ms: Math.round(performance.now() - t0) };

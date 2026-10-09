@@ -1,8 +1,8 @@
 // app.js -- GUI over the raw command surface. Every control resolves to a command line; the command line is the source of truth.
 import { createViewer } from './viewer.js';
-import { loadModel, loadMotion, loadMotionFile, classify, isMapJSON, cleanMap } from './loaders.js';
-import { normalizeRig, analyzeMapping, CORE_BONES, canonical } from './mocap-bake.mjs';
-import { runBake, bytesToBase64 } from './pipeline.js';
+import { loadModel, loadMotion, classify, isMapJSON, cleanMap } from './loaders.js';
+import { normalizeRig, analyzeMapping, CORE_BONES, canonical, motionsFromObject } from './mocap-bake.mjs';
+import { runBake, bytesToBase64, setMeshesHidden } from './pipeline.js';
 import { parseCommand, formatCommand, DEFAULTS, PRESETS, EXAMPLES, HELP } from './command.js';
 import { explainReport, groupUnmapped } from './advice.js';
 import { connectLive } from './live.js';
@@ -141,9 +141,9 @@ function renderChips() {
   $('mapTrackField').hidden = !many;
 }
 
-async function setModel(name, buf) {
+async function setModel(name, buf, parsed) {
   await job(`Loading character ${name}...`, async () => {
-    const { model, dropped, ms } = await loadModel(buf, name);
+    const { model, dropped, ms } = parsed ?? await loadModel(buf, name);
     const rig = normalizeRig(model); // also rejects un-rigged models early
     state.models.set(name, buf);
     state.model = model; state.modelName = name; state.rig = rig; state.map = {}; state.last = null;
@@ -151,7 +151,7 @@ async function setModel(name, buf) {
     state.loadInfo = `${rig.bones.length} bones${dropped.length ? `, ${dropped.length} textures dropped` : ''}`;
     state.modelLoadMs = ms; state.dropped = dropped;
     rig.poseAll(); viewer.setModel(model); $('viewerEmpty').hidden = true;
-    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${rig.mergedSkeletons ? `, merged ${rig.mergedSkeletons} duplicate skeleton(s)` : ''}${rig.attachedMeshes ? `, attached ${rig.attachedMeshes} loose mesh(es) to bones` : ''}${rig.weldedSeamVertices ? `, re-weighted ${rig.weldedSeamVertices} seam vertices` : ''}${rig.reskinnedMeshes ? `, re-skinned ${rig.reskinnedMeshes} mesh(es) with noisy weights from the clean body mesh` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
   }, { pending: { kind: 'character', name } });
 }
 
@@ -201,9 +201,18 @@ function addBvhText(name, text) {
   log(`loaded ${name}: ${source.bones.length} joints, ${source.clip.duration.toFixed(2)} s${bvh.absoluteRootPosition ? '; root positions are absolute (OFFSET not added)' : ''}`, 'dim');
 }
 
+// Returns true when the file turned out to be a character: a skinned FBX/GLB with no clips, picked in the animation box.
 async function addAnimationFile(name, buf) {
+  let asCharacter = null;
   await job(`Loading animation ${name}...`, async () => {
-    const { sources, ms } = await loadMotionFile(buf, name);
+    const parsed = await loadModel(buf, name);
+    // Mixamo T-pose characters carry a one-frame "pose" clip and an empty take: those are not motions
+    const clips = (parsed.animations ?? []).filter(c => c.tracks.length && c.duration > 0.1);
+    if (!clips.length) {
+      let skinned = false; parsed.model.traverse(o => { if (o.isSkinnedMesh) skinned = true; });
+      if (skinned) { asCharacter = parsed; return; }
+    }
+    const t = performance.now(), sources = motionsFromObject(parsed.model, clips), ms = parsed.ms + Math.round(performance.now() - t);
     state.motions = state.motions.filter(m => m.file !== name);
     sources.forEach((source, i) => state.motions.push({
       file: name, ms: i ? 0 : ms, source, info: describeSource(source, source.clip.duration),
@@ -212,6 +221,10 @@ async function addAnimationFile(name, buf) {
     state.last = null;
     log(`loaded ${name}: ${sources.length} animation clip(s), ${sources[0].bones.length} joints`, 'dim');
   }, { pending: { kind: 'track', name } });
+  if (!asCharacter) return false;
+  log(`${name} has no animation clips, so it is used as the character`, 'dim');
+  await setModel(name, buf, asCharacter);
+  return true;
 }
 
 function setMap(name, map) {
@@ -231,7 +244,7 @@ async function ingest(name, buf, role) {
   }
   if (kind === 'model') await setModel(name, buf);
   else if (/\.bvh$/i.test(name)) await job(`Parsing ${name}...`, async () => addBvhText(name, new TextDecoder().decode(buf)), { pending: { kind: 'track', name } });
-  else await addAnimationFile(name, buf);
+  else if (await addAnimationFile(name, buf)) kind = 'model';
   renderChips(); renderMapping(); refreshButtons();
   return kind;
 }
@@ -430,6 +443,8 @@ async function bake(p) {
     const res = await runBake({ model: state.model, motions: motions.map(m => ({ name: m.name, source: m.source })), opts: p.opts, map: state.map, onProgress: (f, label) => progress(j, f, label) });
     const name = p.opts.out || `${baseName(state.modelName)}_${res.clips.length > 1 ? `${res.clips.length}-tracks` : res.clips[0].name}.glb`;
     state.last = { ...res, name, optimized: p.opts.optimize };
+    const hidden = setMeshesHidden(state.model, p.opts.hide);
+    if (p.opts.hide) log(hidden ? `hid ${hidden} mesh(es) matching "${p.opts.hide}"` : `note: no mesh name matches --hide "${p.opts.hide}"`, hidden ? 'dim' : 'err');
     const hip = state.model.getObjectByName(res.report.stages.find(s => s.n === 6).info.hip);
     viewer.setClips(res.clips, hip);
     $('trackSelect').replaceChildren(...res.clips.map((c, i) => { const o = document.createElement('option'); o.value = i; o.textContent = c.name; return o; }));

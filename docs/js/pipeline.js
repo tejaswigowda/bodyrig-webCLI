@@ -20,6 +20,29 @@ export function downscaleTextures(model, max) {
   return n;
 }
 
+// --hide NAME[,NAME]: meshes whose own name or any parent group's name contains a NAME (case-insensitive).
+export function meshesMatching(model, hide) {
+  const names = String(hide ?? '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  if (!names.length) return [];
+  const out = [];
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    for (let p = o; p && p !== model; p = p.parent) if (names.some(n => p.name.toLowerCase().includes(n))) { out.push(o); return; }
+  });
+  return out;
+}
+
+// Preview: hide the matching meshes and show the ones a previous --hide hid. Returns how many match.
+export function setMeshesHidden(model, hide) {
+  const hit = new Set(meshesMatching(model, hide));
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    if (hit.has(o)) { if (o.visible) { o.visible = false; o.userData.hiddenByCommand = true; } }
+    else if (o.userData.hiddenByCommand) { o.visible = true; delete o.userData.hiddenByCommand; }
+  });
+  return hit.size;
+}
+
 async function optimizeOffThread(glb, level) {
   try {
     const worker = new Worker(new URL('./optimize-worker.js', import.meta.url), { type: 'module' });
@@ -108,16 +131,18 @@ export function jpegOpaqueTextures(model) {
   return { count: done.length, restore: () => { for (const t of done) delete t.userData.mimeType; } };
 }
 
-export async function exportGLB(model, clips, { optimize = true, level = 'medium', maxTex = 0, jpeg = true, onOptimize } = {}) {
+export async function exportGLB(model, clips, { optimize = true, level = 'medium', maxTex = 0, jpeg = true, hide = null, onOptimize } = {}) {
   const stages = [];
   let t = performance.now();
+  const left = meshesMatching(model, hide).map(m => [m, m.parent]);
+  for (const [m, p] of left) p.remove(m);
   const downscaled = maxTex ? downscaleTextures(model, maxTex) : 0;
   const alpha = settleAlphaModes(model);
   const jpegs = jpeg ? jpegOpaqueTextures(model) : { count: 0, restore() {} };
   let raw;
   try { raw = await new GLTFExporter().parseAsync(model, { binary: true, animations: [].concat(clips), onlyVisible: false }); }
-  finally { jpegs.restore(); alpha.restore(); }
-  stages.push({ n: 7, name: 'export GLB', ms: Math.round(performance.now() - t), info: { kb: Math.round(raw.byteLength / 1024), animations: [].concat(clips).length, downscaledTextures: downscaled, jpegTextures: jpegs.count, alphaModes: alpha.modes } });
+  finally { jpegs.restore(); alpha.restore(); for (const [m, p] of left) p.add(m); }
+  stages.push({ n: 7, name: 'export GLB', ms: Math.round(performance.now() - t), info: { kb: Math.round(raw.byteLength / 1024), animations: [].concat(clips).length, downscaledTextures: downscaled, jpegTextures: jpegs.count, hiddenMeshes: left.length, alphaModes: alpha.modes } });
   if (!optimize) return { glb: raw, raw, rawBytes: raw.byteLength, stages };
   await onOptimize?.();
   t = performance.now();

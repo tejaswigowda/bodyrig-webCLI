@@ -1,13 +1,13 @@
 // command.js -- the raw control surface. Pure functions (no DOM) so the GUI, the terminal box and tests share one grammar.
 //   bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock] [--map FILE]
-//        [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--out NAME]
+//        [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
 //   map  [--map FILE]        auto-map and print the mapping table
 //   inspect                  print the stage-by-stage report of the last bake
 //   help | clear
 
-export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, mapFile: null, optimize: true, jpeg: true, level: 'medium', maxTex: 0, out: null };
+export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, mapFile: null, optimize: true, jpeg: true, level: 'medium', maxTex: 0, hide: null, out: null };
 export const COMMANDS = ['bake', 'map', 'inspect', 'help', 'clear'];
-const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'level', 'max-tex', 'out']);
+const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'level', 'max-tex', 'hide', 'out']);
 const BOOL_FLAGS = new Set(['in-place', 'loop', 'no-align', 'foot-lock', 'optimize', 'no-optimize', 'no-jpeg']);
 
 export function tokenize(line) {
@@ -62,6 +62,7 @@ export function parseCommand(line) {
     opts.maxTex = +flags['max-tex'];
     if (!Number.isInteger(opts.maxTex) || opts.maxTex < 0) throw new Error('--max-tex must be a non-negative integer (pixels)');
   }
+  if (flags.hide) opts.hide = flags.hide;
   if (flags.out) opts.out = flags.out;
   return { cmd, positional, opts, flags };
 }
@@ -84,6 +85,7 @@ export function formatCommand(opts, { model, motions = [] } = {}) {
   if (!o.optimize) parts.push('--no-optimize');
   else if (o.level !== DEFAULTS.level) parts.push('--level', o.level);
   if (o.maxTex) parts.push('--max-tex', o.maxTex);
+  if (o.hide) parts.push('--hide', q(o.hide));
   if (o.out) parts.push('--out', q(o.out));
   return parts.join(' ');
 }
@@ -107,6 +109,7 @@ export const EXAMPLES = [
   { cmd: 'bake --no-align', note: 'Skip reference-pose alignment (only for rigs already in the BVH rest pose).' },
   { cmd: 'bake --foot-lock', note: 'Pin planted feet and bend the legs with two-bone IK; also keeps the hips at the right height.' },
   { cmd: 'bake --map map.json', note: 'Apply a saved bone map (drop it on the page or save one from the mapping panel).' },
+  { cmd: 'bake --hide Outfits', note: 'Leave out every mesh whose name, or a parent group name, contains "Outfits" (preview and export).' },
   { cmd: 'map', note: 'Auto-map bones and print the table, including unmapped bones.' },
   { cmd: 'inspect', note: 'Show every pipeline stage of the last bake.' },
 ];
@@ -129,4 +132,5 @@ Flags for bake
   --level medium|high          meshopt level
   --max-tex N        downscale textures to at most N px
   --no-jpeg          keep every texture lossless PNG (default: textures without alpha are written as JPEG)
+  --hide NAME[,NAME] leave out meshes whose name or a parent group name contains NAME (case-insensitive), e.g. --hide Outfits
   --out NAME         output file name`;

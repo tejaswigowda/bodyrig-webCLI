@@ -11,7 +11,7 @@ const three = path.join(root, 'node_modules', 'three');
 const files = [
   ['build/three.core.js', 'three/three.core.js'],
   ['build/three.module.js', 'three/three.module.js'],
-  ...['loaders/FBXLoader.js', 'loaders/GLTFLoader.js', 'loaders/BVHLoader.js', 'exporters/GLTFExporter.js', 'controls/OrbitControls.js',
+  ...['loaders/FBXLoader.js', 'loaders/GLTFLoader.js', 'loaders/DRACOLoader.js', 'loaders/BVHLoader.js', 'exporters/GLTFExporter.js', 'controls/OrbitControls.js',
     'utils/BufferGeometryUtils.js', 'utils/SkeletonUtils.js', 'curves/NURBSCurve.js', 'curves/NURBSUtils.js', 'libs/fflate.module.js', 'libs/meshopt_decoder.module.js',
   ].map(f => [`examples/jsm/${f}`, `three/addons/${f}`]),
 ];
@@ -24,6 +24,11 @@ for (const [src, dst] of files) {
   fs.writeFileSync(target, code);
 }
 fs.copyFileSync(path.join(three, 'LICENSE'), path.join(out, 'three', 'LICENSE'));
+
+// The Draco decoder (wasm + glue) is copied as-is: DRACOLoader fetches these same-origin at runtime.
+const dracoOut = path.join(out, 'three/addons/libs/draco/gltf');
+fs.mkdirSync(dracoOut, { recursive: true });
+for (const f of ['draco_decoder.js', 'draco_decoder.wasm', 'draco_wasm_wrapper.js']) fs.copyFileSync(path.join(three, 'examples/jsm/libs/draco/gltf', f), path.join(dracoOut, f));
 
 await build({
   entryPoints: [path.join(root, 'scripts', 'optimizer-entry.mjs')],

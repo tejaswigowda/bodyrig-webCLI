@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, formatCommand, parseTrim, DEFAULTS, PRESETS, EXAMPLES } from '../docs/js/command.js';
 import { parseChannels, parseFrameMessage, resample, buildBVH, LiveRecorder } from '../docs/js/live.js';
-import { canonical, CORE_BONES, parseBVH, mapBones } from '../docs/js/mocap-bake.mjs';
+import { canonical, CORE_BONES, parseBVH, mapBones, normalizeRig } from '../docs/js/mocap-bake.mjs';
 import * as THREE from 'three';
 import { validateLabels, describeBones } from '../docs/js/ai.js';
 import { explainReport } from '../docs/js/advice.js';
@@ -187,4 +187,74 @@ test('webcli: URL is the primitive, owner/repo@ref:path is sugar', async () => {
   assert.ok(calls.every(c => c.init.method === 'GET' && !c.init.body && c.init.credentials === 'omit'));
   assert.equal(calls.length, 2);
   assert.equal((await fetchInput('data:application/octet-stream;base64,AAAA', 'motion-2', fake)).name, 'motion-2.bvh');
+});
+
+test('normalizeRig: per-mesh armature copies fold into one skeleton, loose hair follows a bone', () => {
+  const scene = new THREE.Group();
+  const armature = (group, sfx, extra) => { // extra: names of bones only this copy has
+    const root = new THREE.Bone(), hips = new THREE.Bone(), spine = new THREE.Bone();
+    root.name = `root${sfx}`; hips.name = `pelvis${sfx}`; spine.name = `spine_01${sfx}`;
+    hips.position.set(0, 1, 0); spine.position.set(0, 0.5, 0); root.add(hips); hips.add(spine);
+    const bones = [root, hips, spine];
+    for (const n of extra) { const hand = new THREE.Bone(); hand.name = n; hand.position.set(0.5, 0, 0); spine.add(hand); bones.push(hand); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([0.1, 1.5, 0, 0.2, 1.5, 0, 0.1, 1.6, 0], 3));
+    g.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(new Array(12).fill(0).map((_, i) => (i % 4 ? 0 : 2)), 4));
+    g.setAttribute('skinWeight', new THREE.Float32BufferAttribute(new Array(12).fill(0).map((_, i) => (i % 4 ? 0 : 1)), 4));
+    const mesh = new THREE.SkinnedMesh(g, new THREE.MeshBasicMaterial()); mesh.name = `mesh${sfx}`;
+    group.add(mesh, root); scene.add(group); scene.updateMatrixWorld(true);
+    mesh.bind(new THREE.Skeleton(bones));
+    return { mesh, bones };
+  };
+  const a = armature(new THREE.Group(), '', ['hand_r']), b = armature(new THREE.Group(), '_1', ['hand_l_1', 'hand_x_1']); // b is larger, so it becomes the shared skeleton
+  const hair = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1), new THREE.MeshBasicMaterial());
+  hair.position.set(0.1, 1.55, 0); b.mesh.parent.add(hair); scene.updateMatrixWorld(true);
+  const restB = b.mesh.getVertexPosition(0, new THREE.Vector3()).clone();
+  const rig = normalizeRig(scene);
+  assert.equal(rig.mergedSkeletons, 1);
+  assert.equal(rig.attachedMeshes, 1);
+  assert.equal(hair.parent.name, 'spine_01_1');
+  for (const m of [a.mesh, b.mesh]) assert.equal(m.skeleton.bones[0].name, 'root_1');
+  assert.ok(a.mesh.skeleton.bones.some(x => x.name === 'hand_r' && x.parent.name === 'spine_01_1'), 'a bone only the copy has joins the shared skeleton');
+  scene.updateMatrixWorld(true);
+  assert.ok(b.mesh.getVertexPosition(0, new THREE.Vector3()).distanceTo(restB) < 1e-5, 'rest pose is kept');
+  b.bones[2].rotation.z = 1; scene.updateMatrixWorld(true);
+  const pa = a.mesh.getVertexPosition(0, new THREE.Vector3()), pb = b.mesh.getVertexPosition(0, new THREE.Vector3());
+  assert.ok(pa.distanceTo(pb) < 1e-5 && pa.distanceTo(restB) > 0.05, 'both meshes now follow the same bones');
+  assert.ok(hair.getWorldPosition(new THREE.Vector3()).distanceTo(new THREE.Vector3(0.1, 1.55, 0)) > 0.05, 'hair moved with the spine');
+});
+
+test('normalizeRig: seam copies with different weights are averaged so the mesh cannot tear', () => {
+  const root = new THREE.Bone(), a = new THREE.Bone(), b = new THREE.Bone();
+  root.name = 'root'; a.name = 'pelvis'; b.name = 'spine_01'; a.position.y = 1; b.position.y = 0.5; root.add(a); a.add(b);
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([0, 1, 0, 0, 1, 0, 1, 1, 0], 3)); // vertices 0 and 1 share a position
+  g.setAttribute('skinIndex', new THREE.Uint16BufferAttribute([1, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0], 4));
+  g.setAttribute('skinWeight', new THREE.Float32BufferAttribute([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], 4));
+  const mesh = new THREE.SkinnedMesh(g, new THREE.MeshBasicMaterial()), scene = new THREE.Group();
+  scene.add(mesh, root); scene.updateMatrixWorld(true); mesh.bind(new THREE.Skeleton([root, a, b]));
+  const rig = normalizeRig(scene), si = g.attributes.skinIndex, sw = g.attributes.skinWeight;
+  assert.equal(rig.weldedSeamVertices, 2);
+  for (let k = 0; k < 4; k++) { assert.equal(si.getX(0) === si.getX(1), true); assert.ok(Math.abs(sw.getComponent(0, k) - sw.getComponent(1, k)) < 1e-6); }
+  assert.ok(Math.abs(sw.getX(0) - 0.5) < 1e-6 && Math.abs(sw.getY(0) - 0.5) < 1e-6);
+});
+
+test('command: --hide parses, formats and round-trips', () => {
+  assert.equal(parseCommand('bake --hide Outfits,Hair').opts.hide, 'Outfits,Hair');
+  assert.equal(parseCommand('bake').opts.hide, null);
+  assert.equal(formatCommand({ hide: 'Outfits' }), 'bake --hide Outfits');
+  assert.deepEqual(parseCommand(formatCommand({ hide: 'a b' })).opts.hide, 'a b');
+  assert.throws(() => parseCommand('bake --hide'), /needs a value/);
+});
+
+test('pipeline: --hide matches mesh or parent group names, case-insensitively', async () => {
+  const { meshesMatching, setMeshesHidden } = await import('../docs/js/pipeline.js');
+  const root = new THREE.Group(), grp = new THREE.Group(), a = new THREE.Mesh(), b = new THREE.Mesh(), c = new THREE.Mesh();
+  grp.name = 'bo_Outfits'; a.name = 'Shirt'; b.name = 'my_outfit_pants'; c.name = 'Body';
+  grp.add(a); root.add(grp, b, c);
+  assert.deepEqual(meshesMatching(root, 'outfits').map(m => m.name), ['Shirt']);
+  assert.deepEqual(meshesMatching(root, 'Outfits, pants').map(m => m.name), ['Shirt', 'my_outfit_pants']);
+  assert.deepEqual(meshesMatching(root, null), []);
+  assert.equal(setMeshesHidden(root, 'Outfits'), 1);
+  assert.equal(a.visible, false); assert.equal(c.visible, true);
+  setMeshesHidden(root, null);
+  assert.equal(a.visible, true);
 });
