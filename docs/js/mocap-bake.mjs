@@ -242,6 +242,8 @@ function reskinFromClean(target, clean) {
   });
   if (!dom.length) return false;
   const kd = buildKd(pts, dom.length);
+  // Sources that do not cover the target (a face mesh for a pair of legs) would give it the wrong bones: give up instead.
+  const reach = new THREE.Box3().setFromObject(target).getSize(v).length() * 0.15; let far = 0;
   // A hand or forearm resting at the hip is nearer to a hem vertex than the torso is. A vertex that the garment itself does
   // not weight to any arm bone must not take its weights from one.
   const armMemo = new Map();
@@ -258,6 +260,7 @@ function reskinFromClean(target, clean) {
     let armish = false; { const si = tg.attributes.skinIndex, sw = tg.attributes.skinWeight; for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > 0.05 && inArm(target.skeleton.bones[si.getComponent(i, k)])) armish = true; }
     const found = nearestKd(kd, pts, v.x, v.y, v.z, n => armish || !inArm(dom[n]));
     let best = found.best; const any = found.any;
+    if (any >= 0 && Math.hypot(pts[any * 5] - v.x, pts[any * 5 + 1] - v.y, pts[any * 5 + 2] - v.z) > reach && ++far > tpos.count * 0.1) return false;
     if (best < 0) best = any;
     if (best < 0) return false;
     const c = sources[pts[best * 5 + 3]], vi = pts[best * 5 + 4], si = c.geometry.attributes.skinIndex, sw = c.geometry.attributes.skinWeight, m = new Map();

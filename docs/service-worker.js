@@ -1,5 +1,7 @@
 // Offline-first: precache the app shell and every vendored dependency; everything is same-origin, so nothing third-party is ever cached or fetched.
-const CACHE = 'bodyrig-webcli-v13';
+// App code is fetched network-first (revalidated, so an edited file is never served stale) and falls back to the cache offline;
+// vendored files never change under the same name, so they are cache-first.
+const CACHE = 'bodyrig-webcli-v14';
 const SHELL = [
   './', './index.html', './style.css', './manifest.json', './icon.svg',
   './js/app.js', './js/viewer.js', './js/loaders.js', './js/pipeline.js', './js/command.js', './js/mocap-bake.mjs',
@@ -30,8 +32,10 @@ self.addEventListener('fetch', e => {
   // the one third-party file the app can request, only when the sample button is clicked: cached after first use
   const sample = url.origin === 'https://cdn.jsdelivr.net' && url.pathname.startsWith('/gh/miver-player/miver.xyz@');
   if (url.origin !== self.location.origin && !sample) return;
-  e.respondWith(caches.match(req, { ignoreSearch: true }).then(hit => hit || fetch(req).then(res => {
-    if (res.ok && res.status === 200) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
-    return res;
-  })));
+  const store = res => { if (res.ok && res.status === 200) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); } return res; };
+  if (sample || url.pathname.includes('/vendor/')) {
+    e.respondWith(caches.match(req, { ignoreSearch: true }).then(hit => hit || fetch(req).then(store)));
+    return;
+  }
+  e.respondWith(fetch(req, { cache: 'no-cache' }).then(store).catch(() => caches.match(req, { ignoreSearch: true }).then(hit => hit || Response.error())));
 });

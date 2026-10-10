@@ -173,7 +173,7 @@ Identical immutable input URLs and arguments give byte-identical output. The liv
 
 ## Verify zero egress
 
-Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves them from cache. The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled, and asserts that a `run=bake` from URLs is byte-identical on a second run. There is no write path to audit: no `POST` or `PUT`, no token. The one exception, the sample button's download from jsDelivr, is tested separately with the CDN request intercepted, asserting it is exactly one `GET` to the pinned URL.
+Open DevTools, Network tab, check **Preserve log**, and run a bake. Only static files from this site appear, all `GET`, none carrying a body, and after the first load the service worker serves the vendored files from cache (the app's own files are revalidated with the server and fall back to the cache offline, so an edit is never served stale). The test suite asserts exactly this (every request same-origin, no non-GET, no body) and also bakes with the network disabled, and asserts that a `run=bake` from URLs is byte-identical on a second run. There is no write path to audit: no `POST` or `PUT`, no token. The one exception, the sample button's download from jsDelivr, is tested separately with the CDN request intercepted, asserting it is exactly one `GET` to the pinned URL.
 
 ## Testing (Playwright is the dev loop, not the product)
 
