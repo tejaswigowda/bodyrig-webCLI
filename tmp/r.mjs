@@ -1,0 +1,20 @@
+import { chromium } from 'playwright';
+import { createServer } from '../server.js';
+import os from 'node:os';
+const srv = createServer('docs', {'/fixtures/': 'tests/fixtures', '/dl/': os.homedir() + '/Downloads'});
+await new Promise(r => srv.listen(0, '127.0.0.1', r));
+const b = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const p = await (await b.newContext({ serviceWorkers: 'block' })).newPage();
+await p.goto(`http://127.0.0.1:${srv.address().port}/index.html?nosw`);
+await p.waitForFunction('window.bodyrigWebCLI?.ready');
+console.log(JSON.stringify(await p.evaluate(async () => {
+  const w = window.bodyrigWebCLI;
+  const probe = () => { const m = w.state.model; m.updateMatrixWorld(true); let hips; m.traverse(o => { if (o.name === 'pelvis') hips = o; });
+    const chain = []; for (let o = hips; o; o = o.parent) chain.push(`${o.name || o.type}[s=${o.scale.toArray().map(x => +x.toFixed(3))} p=${o.position.toArray().map(x => +x.toFixed(3))} q=${o.quaternion.toArray().map(x => +x.toFixed(2))}]`);
+    const box = new w.state.model.position.constructor(); const bb = new (w.state.model.position.constructor === undefined ? Object : Object)();
+    return chain; };
+  const res = await w.bakeUrls('/dl/scene.glb', '/fixtures/mocap-33s.bvh', 'bake --no-optimize --max-tex 256 --trim 0:2 --fps 10');
+  const st = res.report.stages.filter(s => [4, 6].includes(s.n)).map(s => ({ n: s.n, info: s.info }));
+  return { chain: probe(), st: JSON.stringify(st).slice(0, 900), glbMB: res.glbBytes / 1e6 };
+}), null, 1));
+await b.close(); srv.close(); process.exit(0);

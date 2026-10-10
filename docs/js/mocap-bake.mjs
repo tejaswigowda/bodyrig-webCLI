@@ -78,9 +78,10 @@ export function motionsFromObject(object, animations) {
 // "twin" bone under each real bone, one set per skin. Collapse twins onto their parent, rebind every skin
 // to the shared bones, and treat the union of all skins' bones as one skeleton (multi-mesh characters).
 const topBone = b => { while (b.parent?.isBone) b = b.parent; return b; };
-// GLTFLoader renames repeated node names with a numeric suffix (pelvis, pelvis_1, pelvis_2); the case can differ too (root, Root).
-const dedupe = n => n.replace(/_\d+$/, '');
-const sameBone = (a, b) => { a = a.toLowerCase(); b = b.toLowerCase(); return a === b || a === dedupe(b) || dedupe(a) === b; };
+// GLTFLoader renames repeated node names with a numeric suffix without a leading zero (pelvis, pelvis_1, pelvis_2); the case can
+// differ too (root, Root). Real names like spine_01 and spine_02 have a leading zero and stay distinct.
+const dedupe = n => n.replace(/_[1-9]\d*$/, '');
+const sameBone = (a, b) => dedupe(a).toLowerCase() === dedupe(b).toLowerCase();
 
 // Multi-armature exports (face / body / outfit meshes, each with its own copy of the skeleton, and each copy holding bones
 // the others lack, like a face rig with no fingers): fold every copy into the largest one. Bones are matched by hierarchy
@@ -120,6 +121,10 @@ function mergeDuplicateSkeletons(skinned) {
   const used = new Set(); for (const sm of skinned) for (const b of sm.skeleton.bones) used.add(topBone(b));
   let removed = 0;
   for (const t of copies) if (counterpart.has(t) && !used.has(t)) { t.parent?.remove(t); removed++; }
+  // the shared skeleton may be the copy the loader renamed (pelvis_3): give it the plain name back so bone mapping recognizes it
+  const kept = []; primary.traverse(o => { if (o.isBone) kept.push(o); });
+  const taken = new Set(kept.map(b => b.name));
+  for (const b of kept) { const n = dedupe(b.name); if (n !== b.name && !taken.has(n)) { taken.delete(b.name); taken.add(n); b.name = n; } }
   return removed;
 }
 
@@ -174,6 +179,49 @@ function weldSeamWeights(sm, bad) {
   return changed;
 }
 
+// k-d tree over flat points [x, y, z, ...] (stride 5), stored implicitly: the median of each index range is its node.
+function buildKd(pts, n) {
+  const ids = Uint32Array.from({ length: n }, (_, i) => i);
+  const select = (lo, hi, k, ax) => { // quickselect: put the k-th smallest by axis at ids[k]
+    while (hi > lo) {
+      const pivot = pts[ids[(lo + hi) >> 1] * 5 + ax]; let i = lo, j = hi;
+      while (i <= j) {
+        while (pts[ids[i] * 5 + ax] < pivot) i++;
+        while (pts[ids[j] * 5 + ax] > pivot) j--;
+        if (i <= j) { const t = ids[i]; ids[i] = ids[j]; ids[j] = t; i++; j--; }
+      }
+      if (k <= j) hi = j; else if (k >= i) lo = i; else return;
+    }
+  };
+  const stack = [[0, n - 1, 0]];
+  while (stack.length) {
+    const [lo, hi, ax] = stack.pop();
+    if (hi <= lo) continue;
+    const mid = (lo + hi) >> 1; select(lo, hi, mid, ax);
+    stack.push([lo, mid - 1, (ax + 1) % 3], [mid + 1, hi, (ax + 1) % 3]);
+  }
+  return ids;
+}
+
+// Nearest point overall (`any`) and nearest one `accept` allows (`best`); -1 when none.
+function nearestKd(ids, pts, x, y, z, accept) {
+  const q = [x, y, z]; let best = -1, bd = Infinity, any = -1, ad = Infinity;
+  const stack = [[0, ids.length - 1, 0]];
+  while (stack.length) {
+    const [lo, hi, ax] = stack.pop();
+    if (hi < lo) continue;
+    const mid = (lo + hi) >> 1, id = ids[mid], o = id * 5;
+    const d = (pts[o] - x) ** 2 + (pts[o + 1] - y) ** 2 + (pts[o + 2] - z) ** 2;
+    if (d < ad) { ad = d; any = id; }
+    if (d < bd && accept(id)) { bd = d; best = id; }
+    const diff = q[ax] - pts[o + ax], next = (ax + 1) % 3;
+    const nearFirst = diff < 0 ? [[lo, mid - 1, next], [mid + 1, hi, next]] : [[mid + 1, hi, next], [lo, mid - 1, next]];
+    if (diff * diff < (best < 0 ? ad : bd)) stack.push(nearFirst[1]); // far side only if it can hold something closer
+    stack.push(nearFirst[0]);
+  }
+  return { best, any };
+}
+
 // A mesh whose seam copies mostly disagree has noisy weights (it tears whenever it moves). Rebuild them the way a
 // "transfer weights" tool does: every vertex takes the weights of the nearest vertex of a clean skinned mesh (the body).
 function reskinFromClean(target, clean) {
@@ -181,22 +229,19 @@ function reskinFromClean(target, clean) {
   if (!sources.length) return false;
   target.updateWorldMatrix(true, false); sources.forEach(c => c.updateWorldMatrix(true, false));
   const tg = target.geometry, tpos = tg.attributes.position, v = new THREE.Vector3();
-  const box = new THREE.Box3(); for (const c of sources) box.expandByObject(c);
-  const cell = Math.max(box.getSize(v).length() / 50, 1e-9);
   const pts = [], dom = []; // pts: flat [x, y, z, sourceIndex, vertexIndex]; dom: each source vertex's strongest bone
-  const grid = new Map(), key = (x, y, z) => ((x + 1024) * 4096 + (y + 1024)) * 4096 + (z + 1024);
   sources.forEach((c, si) => {
     const p = c.geometry.attributes.position;
     for (let i = 0; i < p.count; i++) {
       v.fromBufferAttribute(p, i).applyMatrix4(c.matrixWorld);
-      const k = key(Math.floor(v.x / cell), Math.floor(v.y / cell), Math.floor(v.z / cell)), n = pts.length / 5;
       pts.push(v.x, v.y, v.z, si, i);
       const ws = c.geometry.attributes.skinWeight, ji = c.geometry.attributes.skinIndex; let top = 0;
       for (let k = 1; k < 4; k++) if (ws.getComponent(i, k) > ws.getComponent(i, top)) top = k;
       dom.push(c.skeleton.bones[ji.getComponent(i, top)]);
-      const a = grid.get(k); if (a) a.push(n); else grid.set(k, [n]);
     }
   });
+  if (!dom.length) return false;
+  const kd = buildKd(pts, dom.length);
   // A hand or forearm resting at the hip is nearer to a hem vertex than the torso is. A vertex that the garment itself does
   // not weight to any arm bone must not take its weights from one.
   const armMemo = new Map();
@@ -210,23 +255,9 @@ function reskinFromClean(target, clean) {
   const maps = new Array(tpos.count);
   for (let i = 0; i < tpos.count; i++) {
     v.fromBufferAttribute(tpos, i).applyMatrix4(target.matrixWorld);
-    const cx = Math.floor(v.x / cell), cy = Math.floor(v.y / cell), cz = Math.floor(v.z / cell);
     let armish = false; { const si = tg.attributes.skinIndex, sw = tg.attributes.skinWeight; for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > 0.05 && inArm(target.skeleton.bones[si.getComponent(i, k)])) armish = true; }
-    let best = -1, bd = Infinity, any = -1, ad = Infinity;
-    const visit = (x, y, z) => {
-      for (const n of grid.get(key(x, y, z)) ?? []) {
-        const d = (pts[n * 5] - v.x) ** 2 + (pts[n * 5 + 1] - v.y) ** 2 + (pts[n * 5 + 2] - v.z) ** 2;
-        if (d < ad) { ad = d; any = n; }
-        if (d < bd && (armish || !inArm(dom[n]))) { bd = d; best = n; }
-      }
-    };
-    // grow cube shells around the vertex's cell until no unseen cell can hold a nearer point
-    for (let r = 0; r < 50 && (best < 0 || (r - 1) * cell < Math.sqrt(bd)); r++) {
-      for (let x = cx - r; x <= cx + r; x++) for (let y = cy - r; y <= cy + r; y++) {
-        if (Math.abs(x - cx) === r || Math.abs(y - cy) === r) for (let z = cz - r; z <= cz + r; z++) visit(x, y, z);
-        else { visit(x, y, cz - r); if (r) visit(x, y, cz + r); }
-      }
-    }
+    const found = nearestKd(kd, pts, v.x, v.y, v.z, n => armish || !inArm(dom[n]));
+    let best = found.best; const any = found.any;
     if (best < 0) best = any;
     if (best < 0) return false;
     const c = sources[pts[best * 5 + 3]], vi = pts[best * 5 + 4], si = c.geometry.attributes.skinIndex, sw = c.geometry.attributes.skinWeight, m = new Map();

@@ -212,9 +212,9 @@ test('normalizeRig: per-mesh armature copies fold into one skeleton, loose hair 
   const rig = normalizeRig(scene);
   assert.equal(rig.mergedSkeletons, 1);
   assert.equal(rig.attachedMeshes, 1);
-  assert.equal(hair.parent.name, 'spine_01_1');
-  for (const m of [a.mesh, b.mesh]) assert.equal(m.skeleton.bones[0].name, 'root_1');
-  assert.ok(a.mesh.skeleton.bones.some(x => x.name === 'hand_r' && x.parent.name === 'spine_01_1'), 'a bone only the copy has joins the shared skeleton');
+  assert.equal(hair.parent.name, 'spine_01');
+  for (const m of [a.mesh, b.mesh]) assert.equal(m.skeleton.bones[0].name, 'root');
+  assert.ok(a.mesh.skeleton.bones.some(x => x.name === 'hand_r' && x.parent.name === 'spine_01'), 'a bone only the copy has joins the shared skeleton');
   scene.updateMatrixWorld(true);
   assert.ok(b.mesh.getVertexPosition(0, new THREE.Vector3()).distanceTo(restB) < 1e-5, 'rest pose is kept');
   b.bones[2].rotation.z = 1; scene.updateMatrixWorld(true);
@@ -257,4 +257,22 @@ test('pipeline: --hide matches mesh or parent group names, case-insensitively', 
   assert.equal(a.visible, false); assert.equal(c.visible, true);
   setMeshesHidden(root, null);
   assert.equal(a.visible, true);
+});
+
+test('normalizeRig: copies that both carry loader suffixes merge and get the plain names back', () => {
+  const scene = new THREE.Group(), skins = [];
+  for (const [sfx, extra] of [['_1', 0], ['_3', 1]]) {
+    const hips = new THREE.Bone(), spine = new THREE.Bone(), bones = [hips, spine];
+    hips.name = `pelvis${sfx}`; spine.name = `spine_01${sfx}`; spine.position.y = 0.5; hips.add(spine);
+    if (extra) { const h = new THREE.Bone(); h.name = `head${sfx}`; h.position.y = 0.5; spine.add(h); bones.push(h); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([0, 0.2, 0, 0.1, 0.2, 0, 0, 0.3, 0], 3));
+    g.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(new Array(12).fill(0), 4));
+    g.setAttribute('skinWeight', new THREE.Float32BufferAttribute(new Array(12).fill(0).map((_, i) => (i % 4 ? 0 : 1)), 4));
+    const mesh = new THREE.SkinnedMesh(g, new THREE.MeshBasicMaterial()), grp = new THREE.Group(); grp.add(mesh, hips); scene.add(grp);
+    scene.updateMatrixWorld(true); mesh.bind(new THREE.Skeleton(bones)); skins.push(mesh);
+  }
+  const rig = normalizeRig(scene);
+  assert.equal(rig.mergedSkeletons, 1);
+  assert.deepEqual(rig.bones.map(b => b.name).sort(), ['head', 'pelvis', 'spine_01']);
+  assert.equal(skins[0].skeleton.bones[0], skins[1].skeleton.bones[0]);
 });

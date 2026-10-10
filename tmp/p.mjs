@@ -1,0 +1,21 @@
+import { chromium } from 'playwright';
+import { createServer } from '../server.js';
+import os from 'node:os';
+const file = process.argv[2];
+const srv = createServer('docs', {'/dl/': os.homedir() + '/Downloads'});
+await new Promise(r => srv.listen(0, '127.0.0.1', r));
+const b = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const p = await (await b.newContext({ serviceWorkers: 'block' })).newPage();
+p.on('console', m => { if (m.text().startsWith('T:')) console.log(m.text()); });
+await p.goto(`http://127.0.0.1:${srv.address().port}/index.html?nosw`);
+await p.waitForFunction('window.bodyrigWebCLI?.ready');
+const res = await Promise.race([p.evaluate(async file => {
+  const { loadModel } = await import('./js/loaders.js'); const M = await import('./js/mocap-bake.mjs');
+  const T = (n, t) => console.log('T:', n, Math.round(performance.now() - t));
+  let t = performance.now(); const buf = await (await fetch('/dl/' + file)).arrayBuffer(); T('fetch', t);
+  t = performance.now(); const { model } = await loadModel(buf, file); T('loadModel', t);
+  t = performance.now(); const rig = M.normalizeRig(model); T('normalizeRig', t);
+  return { bones: rig.bones.length, merged: rig.mergedSkeletons, reskinned: rig.reskinnedMeshes, welded: rig.weldedSeamVertices };
+}, file), new Promise(r => setTimeout(() => r('TIMEOUT 120s'), 120000))]);
+console.log(JSON.stringify(res));
+await b.close(); srv.close(); process.exit(0);
