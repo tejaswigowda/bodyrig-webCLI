@@ -179,6 +179,42 @@ function weldSeamWeights(sm, bad) {
   return changed;
 }
 
+// Blend per-vertex weight maps (bone slot -> weight) over the mesh connectivity; seam copies of a position stay identical.
+function smoothWeights(g, maps, iterations, keep) {
+  const pos = g.attributes.position, gid = new Int32Array(pos.count), ids = new Map();
+  for (let i = 0; i < pos.count; i++) {
+    const k = `${Math.round(pos.getX(i) * 1e5)},${Math.round(pos.getY(i) * 1e5)},${Math.round(pos.getZ(i) * 1e5)}`;
+    if (!ids.has(k)) ids.set(k, ids.size); gid[i] = ids.get(k);
+  }
+  const adj = Array.from({ length: ids.size }, () => new Set()), ti = g.index, tris = ti ? ti.count : pos.count;
+  for (let t = 0; t < tris; t += 3) {
+    const a = gid[ti ? ti.getX(t) : t], b = gid[ti ? ti.getX(t + 1) : t + 1], c = gid[ti ? ti.getX(t + 2) : t + 2];
+    adj[a].add(b).add(c); adj[b].add(a).add(c); adj[c].add(a).add(b);
+  }
+  let cur = new Array(ids.size); for (let i = 0; i < pos.count; i++) cur[gid[i]] = maps[i];
+  for (let it = 0; it < iterations; it++) {
+    cur = cur.map((m, g) => {
+      const acc = new Map(), n = adj[g].size || 1;
+      for (const [j, w] of m) acc.set(j, w * keep);
+      for (const h of adj[g]) for (const [j, w] of cur[h]) acc.set(j, (acc.get(j) ?? 0) + (1 - keep) * w / n);
+      const top = [...acc].sort((x, y) => y[1] - x[1]).slice(0, 4), total = top.reduce((t, x) => t + x[1], 0);
+      return new Map(top.map(([j, w]) => [j, w / total]));
+    });
+  }
+  const idx = new Uint16Array(pos.count * 4), wts = new Float32Array(pos.count * 4);
+  for (let i = 0; i < pos.count; i++) [...cur[gid[i]]].forEach(([j, w], k) => { idx[i * 4 + k] = j; wts[i * 4 + k] = w; });
+  return { idx, wts };
+}
+
+// Smooth a mesh's own weights (bone slots are its skeleton indices): the fallback for noisy weights when no clean mesh can be copied from.
+function smoothOwnWeights(sm, iterations, keep) {
+  const g = sm.geometry, si = g.attributes.skinIndex, sw = g.attributes.skinWeight, maps = [];
+  for (let i = 0; i < si.count; i++) { const m = new Map(); for (let k = 0; k < 4; k++) { const w = sw.getComponent(i, k); if (w > 0) m.set(si.getComponent(i, k), (m.get(si.getComponent(i, k)) ?? 0) + w); } maps.push(m); }
+  const { idx, wts } = smoothWeights(g, maps, iterations, keep);
+  g.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(idx, 4));
+  g.setAttribute('skinWeight', new THREE.Float32BufferAttribute(wts, 4));
+}
+
 // k-d tree over flat points [x, y, z, ...] (stride 5), stored implicitly: the median of each index range is its node.
 function buildKd(pts, n) {
   const ids = Uint32Array.from({ length: n }, (_, i) => i);
@@ -310,11 +346,11 @@ export function normalizeRig(model) {
   const seams = new Map(skinned.map(sm => [sm, seamGroups(sm)]));
   const noisy = sm => { const s = seams.get(sm); return s.total >= 20 && s.bad.length / s.total > 0.2; };
   const clean = skinned.filter(sm => seams.get(sm).total && !seams.get(sm).bad.length);
-  let weldedSeamVertices = 0, reskinnedMeshes = 0;
+  let weldedSeamVertices = 0, reskinnedMeshes = 0, smoothedMeshes = 0;
   for (const sm of skinned) {
     if (!seams.get(sm).bad.length) continue;
     if (noisy(sm) && reskinFromClean(sm, clean)) reskinnedMeshes++;
-    else weldedSeamVertices += weldSeamWeights(sm, seams.get(sm).bad);
+    else { weldedSeamVertices += weldSeamWeights(sm, seams.get(sm).bad); if (noisy(sm)) { smoothOwnWeights(sm, 8, 0.3); smoothedMeshes++; } }
   }
   // glTF requires skin.skeleton (exported as bones[0]) to be a common root of all joints. Partial skins
   // (e.g. a "Body" mesh weighted from Spine2 up) violate that: move/insert the top root at index 0.
@@ -335,7 +371,7 @@ export function normalizeRig(model) {
   for (const b of [...bones]) for (let p = b.parent; p?.isBone; p = p.parent) bones.add(p);
   const poseAll = () => { for (const sm of skinned) sm.skeleton.pose(); model.updateMatrixWorld(true); };
   const attachedMeshes = attachLooseMeshes(model, bones);
-  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed, mergedSkeletons, weldedSeamVertices, reskinnedMeshes, attachedMeshes };
+  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed, mergedSkeletons, weldedSeamVertices, reskinnedMeshes, smoothedMeshes, attachedMeshes };
 }
 
 // `override` maps a target bone's canonical name -> source bone name; an empty string pins the bone to rest pose.

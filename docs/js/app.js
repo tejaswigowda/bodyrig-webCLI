@@ -151,7 +151,7 @@ async function setModel(name, buf, parsed) {
     state.loadInfo = `${rig.bones.length} bones${dropped.length ? `, ${dropped.length} textures dropped` : ''}`;
     state.modelLoadMs = ms; state.dropped = dropped;
     rig.poseAll(); viewer.setModel(model); $('viewerEmpty').hidden = true;
-    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${rig.mergedSkeletons ? `, merged ${rig.mergedSkeletons} duplicate skeleton(s)` : ''}${rig.attachedMeshes ? `, attached ${rig.attachedMeshes} loose mesh(es) to bones` : ''}${rig.weldedSeamVertices ? `, re-weighted ${rig.weldedSeamVertices} seam vertices` : ''}${rig.reskinnedMeshes ? `, re-skinned ${rig.reskinnedMeshes} mesh(es) with noisy weights from the clean body mesh` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${rig.mergedSkeletons ? `, merged ${rig.mergedSkeletons} duplicate skeleton(s)` : ''}${rig.attachedMeshes ? `, attached ${rig.attachedMeshes} loose mesh(es) to bones` : ''}${rig.weldedSeamVertices ? `, re-weighted ${rig.weldedSeamVertices} seam vertices` : ''}${rig.smoothedMeshes ? `, smoothed noisy weights on ${rig.smoothedMeshes} mesh(es)` : ''}${rig.reskinnedMeshes ? `, re-skinned ${rig.reskinnedMeshes} mesh(es) with noisy weights from the clean body mesh` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
   }, { pending: { kind: 'character', name } });
 }
 
