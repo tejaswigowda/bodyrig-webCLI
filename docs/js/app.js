@@ -2,8 +2,9 @@
 import { createViewer } from './viewer.js';
 import { loadModel, loadMotion, classify, isMapJSON, cleanMap } from './loaders.js';
 import { normalizeRig, analyzeMapping, CORE_BONES, canonical, motionsFromObject } from './mocap-bake.mjs';
-import { runBake, bytesToBase64, setMeshesHidden } from './pipeline.js';
-import { parseCommand, formatCommand, DEFAULTS, PRESETS, EXAMPLES, HELP } from './command.js';
+import { runBake, bytesToBase64, setMeshesHidden, meshesMatching } from './pipeline.js';
+import { isFaceRecord, parseFaceRecord, isMorphMap, parseMorphMap, findFaceMesh, blendshapeStatus } from './face.mjs';
+import { parseCommand, parseUnit, formatCommand, DEFAULTS, PRESETS, EXAMPLES, HELP } from './command.js';
 import { explainReport, groupUnmapped } from './advice.js';
 import { connectLive } from './live.js';
 import * as ai from './ai.js';
@@ -14,13 +15,15 @@ const $ = id => document.getElementById(id);
 const viewer = createViewer($('viewer'));
 
 const state = {
-  files: new Map(),           // name -> { kind: 'map', map } -- saved / loaded bone maps
+  files: new Map(),           // name -> { kind: 'map', map } bone maps | { kind: 'morph', map } morph maps | { kind: 'face', record } face JSON
   models: new Map(),          // character file name -> bytes, so a command can switch characters by name
   opts: { ...DEFAULTS },
+  trackName: null,            // the preview track the user picked, kept across re-bakes
   model: null, modelName: null, rig: null, loadInfo: null,
   motions: [],                // animation tracks: { file, name, source, info, ms, text? } -- one per BVH, one per clip of an FBX / GLB
   mapTrack: 0,                // which track the mapping panel shows
   map: {}, last: null, busy: false, live: null, ai: null,
+  pairs: new Map(),           // body track file -> face file; the pair is one body + face unit
 };
 
 // ---------- agent contract: data-webcli-status + window.__webcli_result (same shape across the family) ----------
@@ -31,7 +34,7 @@ function publishResult(r) {
   const artifact = { mime, name: r.name, size: r.glb.byteLength };
   Object.defineProperty(artifact, 'dataUrl', { enumerable: true, get: () => (dataUrl ??= `data:${mime};base64,${bytesToBase64(r.glb)}`) });
   const rep = r.report;
-  window.__webcli_result = { ok: true, op: 'bake', artifact, error: null, meta: { tracks: r.clips.map(c => c.name), frames: rep.frames, fps: rep.fps, mapped: rep.mapped, bones: rep.bones } };
+  window.__webcli_result = { ok: true, op: 'bake', artifact, error: null, meta: { tracks: r.clips.map(c => c.name), frames: rep.frames, fps: rep.fps, mapped: rep.mapped, bones: rep.bones, units: rep.units, blendshapes: rep.blendshapes } };
   webcliStatus('done');
 }
 webcliStatus('idle');
@@ -72,7 +75,7 @@ async function job(label, fn, info = {}) {
 function progress(j, fraction, label) { j.fraction = fraction; if (label) j.label = label; renderBusy(); }
 
 // ---------- options <-> UI <-> command ----------
-const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'level', 'inPlace', 'loop', 'align', 'footLock', 'optimize'];
+const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'level', 'inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead'];
 
 function readOpts() {
   const o = { ...state.opts };
@@ -81,7 +84,7 @@ function readOpts() {
   o.trim = s !== '' || e !== '' ? [s === '' ? 0 : +s, e === '' ? null : +e] : null;
   o.maxTex = Math.max(0, Math.round(+$('maxTex').value || 0));
   o.level = $('level').value;
-  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize']) o[k] = $(k).checked;
+  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead']) o[k] = $(k).checked;
   return o;
 }
 
@@ -92,22 +95,22 @@ function writeOpts(o) {
   $('trimEnd').value = state.opts.trim?.[1] ?? '';
   $('maxTex').value = state.opts.maxTex || '';
   $('level').value = state.opts.level;
-  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize']) $(k).checked = state.opts[k];
-  $('cmd').value = formatCommand(state.opts);
+  for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead']) $(k).checked = state.opts[k];
+  refreshCmd();
 }
 
-for (const id of optInputs) $(id).addEventListener('input', () => { state.opts = readOpts(); $('cmd').value = formatCommand(state.opts); });
+for (const id of optInputs) $(id).addEventListener('input', () => { state.opts = readOpts(); refreshCmd(); });
 
 $('presets').append(...PRESETS.map(p => {
   const b = document.createElement('button'); b.className = 'preset';
   b.innerHTML = `<b>${p.label}</b><span>${p.desc}</span>`;
-  b.onclick = () => { writeOpts({ ...parseCommand(p.cmd).opts, mapFile: state.opts.mapFile }); };
+  b.onclick = () => { writeOpts({ ...parseCommand(p.cmd).opts, mapFile: state.opts.mapFile, morphMapFile: state.opts.morphMapFile }); };
   return b;
 }));
 $('examples').append(...EXAMPLES.map(x => {
   const b = document.createElement('button'); b.className = 'example';
   b.innerHTML = `<code></code><span></span>`; b.firstChild.textContent = x.cmd; b.lastChild.textContent = x.note;
-  b.onclick = () => { if (x.cmd.startsWith('bake')) writeOpts({ ...parseCommand(x.cmd).opts, mapFile: x.cmd.includes('--map') ? state.opts.mapFile : null }); $('cmd').value = x.cmd; $('cmd').focus(); };
+  b.onclick = () => { if (x.cmd.startsWith('bake')) writeOpts({ ...parseCommand(x.cmd).opts, mapFile: x.cmd.includes('--map') ? state.opts.mapFile : null, morphMapFile: x.cmd.includes('--morph-map') ? state.opts.morphMapFile : null }); $('cmd').value = x.cmd; $('cmd').focus(); };
   return b;
 }));
 
@@ -115,12 +118,64 @@ $('examples').append(...EXAMPLES.map(x => {
 const curMotion = () => state.motions[Math.min(state.mapTrack, state.motions.length - 1)] ?? null;
 const bvhHeaderText = () => state.motions.find(m => m.text)?.text ?? null;
 
+// ---------- body + face units ----------
+const faceNames = () => [...state.files].filter(([, f]) => f.kind === 'face').map(([n]) => n);
+const currentMorphMap = () => { const f = state.opts.morphMapFile ? state.files.get(state.opts.morphMapFile) : null; return f?.kind === 'morph' ? f.map : {}; };
+const commandLine = opts => formatCommand(opts, { motions: unitTokens() });
+const refreshCmd = () => { $('cmd').value = commandLine(state.opts); };
+
+// Which ARKit-52 names the character's morph targets cover. Hidden meshes are skipped, as in a bake.
+function faceMatch() {
+  if (!state.model) return null;
+  const hidden = new Set(meshesMatching(state.model, state.opts.hide));
+  const best = findFaceMesh(state.model, { skip: o => hidden.has(o), morphMap: currentMorphMap() });
+  return blendshapeStatus(best?.matched, { meshName: best?.mesh.name ?? null });
+}
+const blendShort = s => (s.level === 'none' ? 'no blendshapes' : `${s.matched}/${s.total} blendshapes${s.level === 'partial' ? ' (partial)' : ''}`);
+const blendClass = s => (s.level === 'ok' ? 'ok' : s.level === 'partial' ? 'dim' : 'err');
+function logBlendshapes() {
+  const s = faceMatch();
+  if (s) log(s.text, blendClass(s));
+}
+const faceMeta = r => `${r.frames.length} frames at ${r.fps} fps, ${r.channels.length} ARKit channels`;
+
+// Command-line units: each track with its chosen face as `body+face`, then each face that is not paired as a face-only unit.
+// Empty until a face is loaded, so plain bakes keep the implicit "every loaded track" form.
+function unitTokens() {
+  const faces = faceNames();
+  if (!faces.length) return [];
+  const paired = new Set(state.pairs.values());
+  const bodies = [...new Set(state.motions.map(m => m.file))].map(f => (state.pairs.get(f) ? `${f}+${state.pairs.get(f)}` : f));
+  return [...bodies, ...faces.filter(n => !paired.has(n))];
+}
+
+function pairSelect(file) {
+  const s = document.createElement('select');
+  s.className = 'pair-select'; s.title = 'Face record to pair with this track (one body + face unit)';
+  s.setAttribute('aria-label', `Face paired with ${file}`);
+  s.append(new Option('no face', ''), ...faceNames().map(n => new Option(n, n)));
+  s.value = state.pairs.get(file) ?? '';
+  s.onchange = () => setPair(file, s.value || null);
+  return s;
+}
+
+function setPair(file, face) {
+  if (face) state.pairs.set(file, face); else state.pairs.delete(file);
+  state.last = null; refreshCmd(); renderChips();
+  log(face ? `paired ${file} with ${face}: one body + face unit` : `${file} has no face`, 'dim');
+  setStatus('Pairing changed. Press Bake to apply.');
+}
+
 function renderChips() {
   const rows = [];
   const removing = key => [...jobs].some(j => j.removing === key);
-  if (state.modelName) rows.push({ kind: 'character', name: state.modelName, meta: state.loadInfo, key: 'character', rm: true });
-  for (const m of state.motions) rows.push({ kind: 'track', name: m.name, meta: m.info, key: m.file, file: m.file, rm: true });
-  for (const [n, f] of state.files) if (f.kind === 'map') rows.push({ kind: 'bone map', name: n, meta: `${Object.keys(f.map).length} entries` });
+  if (state.modelName) rows.push({ kind: 'character', name: state.modelName, meta: `${state.loadInfo} · ${blendShort(faceMatch())}`, key: 'character', remove: removeCharacter });
+  state.motions.forEach(m => rows.push({ kind: 'track', name: m.name, meta: m.info, key: m.file, remove: () => removeMotionFile(m.file), pairFile: state.motions.find(x => x.file === m.file) === m ? m.file : null }));
+  for (const [n, f] of state.files) {
+    if (f.kind === 'map') rows.push({ kind: 'bone map', name: n, meta: `${Object.keys(f.map).length} entries` });
+    else if (f.kind === 'morph') rows.push({ kind: 'morph map', name: n, meta: `${Object.keys(f.map).length} entries`, key: n, remove: () => removeAsset(n) });
+    else if (f.kind === 'face') rows.push({ kind: 'face', name: n, meta: faceMeta(f.record), key: n, remove: () => removeAsset(n) });
+  }
   for (const j of jobs) if (j.pending) rows.push({ kind: j.pending.kind, name: j.pending.name, meta: 'loading...', busy: true });
   $('chips').replaceChildren(...rows.map(r => {
     const busy = r.busy || removing(r.key);
@@ -128,10 +183,13 @@ function renderChips() {
     d.innerHTML = '<span class="kind"></span><span class="name"></span><span class="meta"></span>';
     d.children[0].textContent = r.kind; d.children[1].textContent = r.name; d.children[2].textContent = removing(r.key) ? 'removing...' : r.meta ?? '';
     if (busy) { const s = document.createElement('span'); s.className = 'spinner'; d.appendChild(s); }
-    else if (r.rm) {
-      const b = document.createElement('button'); b.className = 'rm'; b.textContent = '\u00d7'; b.title = `Remove ${r.name}`; b.setAttribute('aria-label', `Remove ${r.name}`);
-      b.onclick = () => (r.file ? removeMotionFile(r.file) : removeCharacter());
-      d.appendChild(b);
+    else {
+      if (r.pairFile && faceNames().length) d.appendChild(pairSelect(r.pairFile));
+      if (r.remove) {
+        const b = document.createElement('button'); b.className = 'rm'; b.textContent = '\u00d7'; b.title = `Remove ${r.name}`; b.setAttribute('aria-label', `Remove ${r.name}`);
+        b.onclick = () => r.remove();
+        d.appendChild(b);
+      }
     }
     return d;
   }));
@@ -151,7 +209,8 @@ async function setModel(name, buf, parsed) {
     state.loadInfo = `${rig.bones.length} bones${dropped.length ? `, ${dropped.length} textures dropped` : ''}`;
     state.modelLoadMs = ms; state.dropped = dropped;
     rig.poseAll(); viewer.setModel(model); $('viewerEmpty').hidden = true;
-    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${rig.mergedSkeletons ? `, merged ${rig.mergedSkeletons} duplicate skeleton(s)` : ''}${rig.attachedMeshes ? `, attached ${rig.attachedMeshes} loose mesh(es) to bones` : ''}${rig.weldedSeamVertices ? `, re-weighted ${rig.weldedSeamVertices} seam vertices` : ''}${rig.smoothedMeshes ? `, smoothed noisy weights on ${rig.smoothedMeshes} mesh(es)` : ''}${rig.reskinnedMeshes ? `, re-skinned ${rig.reskinnedMeshes} mesh(es) with noisy weights from the clean body mesh` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+    log(`loaded ${name}: ${rig.bones.length} bones, ${rig.skins} skin(s)${rig.removedTwinBones ? `, collapsed ${rig.removedTwinBones} twin bones` : ''}${rig.mergedSkeletons ? `, merged ${rig.mergedSkeletons} duplicate skeleton(s)` : ''}${rig.attachedMeshes ? `, attached ${rig.attachedMeshes} loose mesh(es) to bones` : ''}${rig.weldedSeamVertices ? `, re-weighted ${rig.weldedSeamVertices} seam vertices` : ''}${rig.proximityMeshes ? `, re-skinned ${rig.proximityMeshes} mesh(es) by bone proximity` : ''}${rig.smoothedMeshes ? `, smoothed noisy weights on ${rig.smoothedMeshes} mesh(es)` : ''}${rig.reskinnedMeshes ? `, re-skinned ${rig.reskinnedMeshes} mesh(es) with noisy weights from the clean body mesh` : ''}${dropped.length ? `, dropped ${dropped.length} unresolved textures` : ''}`, 'dim');
+    logBlendshapes();
   }, { pending: { kind: 'character', name } });
 }
 
@@ -165,6 +224,7 @@ function resetResult() {
 }
 
 async function afterRemoval() {
+  refreshCmd();
   if (isReady()) await execute('bake'); else { resetResult(); setStatus(state.model ? 'Add an animation track.' : 'Drop a character and at least one animation to begin.'); }
 }
 
@@ -172,10 +232,24 @@ async function removeMotionFile(file) {
   try {
     await job(`Removing ${file}...`, async () => {
       state.motions = state.motions.filter(m => m.file !== file);
+      state.pairs.delete(file);
       state.mapTrack = Math.min(state.mapTrack, Math.max(0, state.motions.length - 1));
       state.last = null; renderMapping();
       log(`removed ${file}`, 'dim');
     }, { removing: file });
+    await afterRemoval();
+  } catch (e) { fail(e); }
+}
+
+async function removeAsset(name) {
+  try {
+    await job(`Removing ${name}...`, async () => {
+      state.files.delete(name);
+      for (const [body, face] of [...state.pairs]) if (face === name) state.pairs.delete(body);
+      if (state.opts.morphMapFile === name) state.opts.morphMapFile = null;
+      state.last = null;
+      log(`removed ${name}`, 'dim');
+    }, { removing: name });
     await afterRemoval();
   } catch (e) { fail(e); }
 }
@@ -227,9 +301,24 @@ async function addAnimationFile(name, buf) {
   return true;
 }
 
+function addFace(name, json) {
+  const record = parseFaceRecord(json);
+  state.files.set(name, { kind: 'face', record });
+  const ign = record.ignored.length ? `; ignoring ${record.ignored.length} unknown channel(s): ${record.ignored.slice(0, 4).join(', ')}${record.ignored.length > 4 ? ', ...' : ''}` : '';
+  log(`loaded face ${name}: ${faceMeta(record)}${record.head ? '; head rotation included (used with --face-head)' : ''}${ign}`, 'dim');
+  logBlendshapes();
+}
+
+function setMorphMap(name, map) {
+  state.files.set(name, { kind: 'morph', map });
+  state.opts.morphMapFile = name; refreshCmd();
+  log(`loaded morph map ${name} (${Object.keys(map).length} entries); use --morph-map ${name}`, 'dim');
+  logBlendshapes();
+}
+
 function setMap(name, map) {
   state.files.set(name, { kind: 'map', map });
-  state.map = { ...map }; state.opts.mapFile = name; $('cmd').value = formatCommand(state.opts);
+  state.map = { ...map }; state.opts.mapFile = name; refreshCmd();
   log(`loaded bone map ${name} (${Object.keys(map).length} entries); use --map ${name}`, 'dim');
 }
 
@@ -239,8 +328,11 @@ async function ingest(name, buf, role) {
   if (!kind) throw new Error(`Unsupported file type: ${name}`);
   if (kind === 'json') {
     const json = JSON.parse(new TextDecoder().decode(buf));
+    if (isFaceRecord(json)) { addFace(name, json); renderChips(); refreshButtons(); refreshCmd(); return 'face'; }
+    if (isMorphMap(json)) { setMorphMap(name, parseMorphMap(json)); renderChips(); refreshButtons(); refreshCmd(); return 'morph'; }
     kind = isMapJSON(json) ? 'map' : 'model';
     if (kind === 'map') { setMap(name, cleanMap(json)); renderChips(); renderMapping(); return kind; }
+    if (kind === 'model' && role === 'motion') throw new Error(`${name} is not a face record, morph map or bone map. Character files go in Character.`);
   }
   if (kind === 'model') await setModel(name, buf);
   else if (/\.bvh$/i.test(name)) await job(`Parsing ${name}...`, async () => addBvhText(name, new TextDecoder().decode(buf)), { pending: { kind: 'track', name } });
@@ -249,7 +341,7 @@ async function ingest(name, buf, role) {
   return kind;
 }
 
-const isReady = () => !!(state.model && state.motions.length);
+const isReady = () => !!(state.model && (state.motions.length || faceNames().length));
 
 async function ingestFiles(list, role) {
   const files = [...list];
@@ -332,7 +424,7 @@ function renderMapping() {
     if (!r.manual && r.source) sel.options[0].textContent = `auto: ${r.source}`;
     sel.onchange = () => {
       if (sel.value === '__auto__') delete state.map[r.canonical]; else state.map[r.canonical] = sel.value;
-      state.opts.mapFile = null; $('cmd').value = formatCommand(state.opts); renderMapping();
+      state.opts.mapFile = null; refreshCmd(); renderMapping();
     };
     tr.innerHTML = '<td></td><td></td><td></td>'; tr.children[0].textContent = r.target; tr.children[1].textContent = r.canonical; tr.children[2].appendChild(sel);
     return tr;
@@ -342,7 +434,7 @@ function renderMapping() {
 
 $('mapCore').onchange = renderMapping;
 $('mapTrack').onchange = () => { state.mapTrack = +$('mapTrack').value; renderMapping(); };
-$('btnAutoMap').onclick = () => { state.map = {}; state.opts.mapFile = null; $('cmd').value = formatCommand(state.opts); renderMapping(); log('mapping reset to automatic', 'dim'); };
+$('btnAutoMap').onclick = () => { state.map = {}; state.opts.mapFile = null; refreshCmd(); renderMapping(); log('mapping reset to automatic', 'dim'); };
 
 function currentMapTable() {
   const a = analysis(); const out = {};
@@ -354,7 +446,7 @@ $('btnSaveMap').onclick = () => {
   const name = `${baseName(state.modelName || 'character')}.map.json`;
   const table = currentMapTable();
   state.files.set(name, { kind: 'map', map: table });
-  state.opts.mapFile = name; $('cmd').value = formatCommand(state.opts);
+  state.opts.mapFile = name; refreshCmd();
   download(new Blob([JSON.stringify(table, null, 2)], { type: 'application/json' }), name);
   renderChips(); log(`saved ${name}; reuse with --map ${name}`, 'ok');
 };
@@ -383,19 +475,44 @@ function renderStages(report) {
 renderStages(null);
 
 // ---------- command execution ----------
-// Returns the tracks to bake: the motion files named on the command line, or every loaded track.
-async function resolveInputs(p) {
-  let modelChosen = false; const motionFiles = [];
+// Resolves the command's inputs into units. A unit is a body track, a face record, or both (`body+face`).
+// With no positional units, every loaded track is baked with its chosen face, and faces that are not paired become face-only units.
+async function resolveUnits(p) {
+  let modelChosen = false; const tokens = [];
   for (const n of p.positional) {
     if (!modelChosen && state.models.has(n)) { modelChosen = true; if (n !== state.modelName) await setModel(n, state.models.get(n)); }
-    else if (state.motions.some(m => m.file === n)) motionFiles.push(n);
-    else if (state.files.get(n)?.kind === 'map') throw new Error(`"${n}" is a bone map; pass it with --map.`);
-    else throw new Error(`"${n}" is not loaded. Drop it on the page first.`);
+    else tokens.push(n);
   }
   if (!state.model) throw new Error('No character loaded. Drop an FBX, GLB or VRM into Character.');
-  const motions = motionFiles.length ? state.motions.filter(m => motionFiles.includes(m.file)) : state.motions;
-  if (!motions.length) throw new Error('No animation loaded. Drop a BVH, FBX or GLB into Animation tracks.');
-  return motions;
+  const units = [], bodyPairs = new Map();
+  const faceOf = name => { const f = state.files.get(name); if (f?.kind !== 'face') throw new Error(`"${name}" is not a loaded face record. Drop a face JSON on the page first.`); return f.record; };
+  const unitFor = (m, face) => ({ body: { name: m.name, source: m.source }, face: face ? { name: face, record: faceOf(face) } : null });
+  const motionsOf = file => { const ms = state.motions.filter(m => m.file === file); if (!ms.length) throw new Error(`"${file}" is not loaded. Drop it on the page first.`); return ms; };
+  if (!tokens.length) {
+    for (const m of state.motions) units.push(unitFor(m, state.pairs.get(m.file) ?? null));
+    const paired = new Set(state.pairs.values());
+    for (const n of faceNames()) if (!paired.has(n)) units.push({ body: null, face: { name: n, record: faceOf(n) } });
+  } else for (const t of tokens) {
+    const f = state.files.get(t);
+    if (t.includes('+')) {
+      const { body, face } = parseUnit(t);
+      for (const m of motionsOf(body)) units.push(unitFor(m, face));
+      bodyPairs.set(body, face);
+    }
+    else if (state.motions.some(m => m.file === t)) { for (const m of motionsOf(t)) units.push(unitFor(m, null)); bodyPairs.set(t, null); }
+    else if (f?.kind === 'face') units.push({ body: null, face: { name: t, record: f.record } });
+    else if (f?.kind === 'map') throw new Error(`"${t}" is a bone map; pass it with --map.`);
+    else if (f?.kind === 'morph') throw new Error(`"${t}" is a morph map; pass it with --morph-map.`);
+    else throw new Error(`"${t}" is not loaded. Drop it on the page first.`);
+  }
+  if (!units.length) throw new Error('No animation loaded. Drop a BVH, FBX, GLB or face JSON into Animation tracks.');
+  return { units, bodyPairs: tokens.length ? bodyPairs : new Map() };
+}
+
+function applyMorphFile(name) {
+  if (!name) return;
+  const f = state.files.get(name);
+  if (!f || f.kind !== 'morph') throw new Error(`Morph map "${name}" is not loaded. Drop it on the page first.`);
 }
 
 function printMapping() {
@@ -417,7 +534,7 @@ async function executeRaw(line) {
     case 'help': log(HELP, 'dim'); return null;
     case 'clear': $('log').replaceChildren(); return null;
     case 'inspect': printReport(); return null;
-    case 'map': await resolveInputs(p); applyMapFile(p.opts.mapFile); renderMapping(); printMapping(); return null;
+    case 'map': await resolveUnits(p); applyMapFile(p.opts.mapFile); renderMapping(); printMapping(); return null;
     case 'bake': return bake(p);
   }
 }
@@ -429,31 +546,47 @@ function applyMapFile(name) {
   state.map = { ...f.map }; renderMapping();
 }
 
+// One line per unit in the bake log: what was baked for the body, the face, and the head.
+function logUnit(u) {
+  const parts = [u.body ? 'body' : 'face only'];
+  if (u.face?.status === 'baked') parts.push(`face ${u.face.channels}/52 blendshapes${u.face.outOfRange ? `; ${u.face.outOfRange} sample(s) past the recording, held at the nearest frame` : ''}`);
+  else if (u.face) parts.push(`face skipped: ${u.face.reason}`);
+  if (u.head === 'face') parts.push('head from face (experimental)');
+  else if (u.head) parts.push(u.head);
+  log(`unit ${u.name}: ${parts.join('; ')}`, u.face?.status === 'skipped' || u.head?.startsWith('skipped') ? 'err' : 'dim');
+}
+
 async function bake(p) {
   if (state.busy) throw new Error('A bake is already running.');
-  const motions = await resolveInputs(p);
+  const { units, bodyPairs } = await resolveUnits(p);
+  for (const [file, face] of bodyPairs) { if (face) state.pairs.set(file, face); else state.pairs.delete(file); }
   writeOpts(p.opts);
   applyMapFile(p.opts.mapFile);
+  applyMorphFile(p.opts.morphMapFile);
   const manual = Object.keys(state.map).length;
   if (manual && !p.opts.mapFile) log(`note: ${manual} manual mapping override(s) active; save the map to reproduce this with --map`, 'dim');
   state.busy = true; refreshButtons(); webcliStatus('running');
   try {
-    return await job(`Retargeting ${motions.length} track${motions.length > 1 ? 's' : ''}...`, async j => {
+    return await job(`Baking ${units.length} unit${units.length > 1 ? 's' : ''}...`, async j => {
     const t = performance.now();
-    const res = await runBake({ model: state.model, motions: motions.map(m => ({ name: m.name, source: m.source })), opts: p.opts, map: state.map, onProgress: (f, label) => progress(j, f, label) });
+    const res = await runBake({ model: state.model, units, opts: p.opts, map: state.map, morphMap: currentMorphMap(), onProgress: (f, label) => progress(j, f, label) });
     const name = p.opts.out || `${baseName(state.modelName)}_${res.clips.length > 1 ? `${res.clips.length}-tracks` : res.clips[0].name}.glb`;
     state.last = { ...res, name, optimized: p.opts.optimize };
     const hidden = setMeshesHidden(state.model, p.opts.hide);
     if (p.opts.hide) log(hidden ? `hid ${hidden} mesh(es) matching "${p.opts.hide}"` : `note: no mesh name matches --hide "${p.opts.hide}"`, hidden ? 'dim' : 'err');
-    const hip = state.model.getObjectByName(res.report.stages.find(s => s.n === 6).info.hip);
-    viewer.setClips(res.clips, hip);
+    const hipName = res.report.stages.find(s => s.n === 6)?.info?.hip;
+    const keep = Math.max(0, res.clips.findIndex(c => c.name === state.trackName));
+    viewer.setClips(res.clips, hipName ? state.model.getObjectByName(hipName) : null, keep);
     $('trackSelect').replaceChildren(...res.clips.map((c, i) => { const o = document.createElement('option'); o.value = i; o.textContent = c.name; return o; }));
+    $('trackSelect').value = keep; state.trackName = res.clips[keep].name;
     $('trackSelect').hidden = res.clips.length < 2;
     renderStages(res.report); renderMapping(); recordStats(res.report);
     $('resultCard').hidden = false; $('resultHint').hidden = false;
     const tracks = res.clips.length > 1 ? `${res.clips.length} tracks (${res.report.tracks.map(t => `${t.name} ${t.duration.toFixed(1)} s`).join(', ')}) at ${res.report.fps} fps` : `${res.report.duration.toFixed(1)} s, ${res.report.frames} frames at ${res.report.fps} fps`;
     $('resultInfo').textContent = `${name}: ${kb(res.glb.byteLength)}${p.opts.optimize ? ` (raw ${kb(res.rawBytes)})` : ''} | ${tracks} | ${res.report.mapped}/${res.report.bones} bones mapped | total ${fmtMs(performance.now() - t)}`;
     log(`baked ${name}: ${kb(res.glb.byteLength)}, ${res.clips.length} track(s), ${res.report.tracks.reduce((s, x) => s + x.frames, 0)} frames in ${fmtMs(performance.now() - t)}`, 'ok');
+    for (const u of res.report.units) logUnit(u);
+    if (res.report.blendshapes) log(res.report.blendshapes.text, blendClass(res.report.blendshapes));
     setStatus(`Done: ${name} (${kb(res.glb.byteLength)}). Playing preview.`);
     $('btnPlay').disabled = false; $('scrub').disabled = false; viewer.play(); $('btnPlay').textContent = 'Pause';
     publishResult(state.last);
@@ -467,14 +600,14 @@ async function execute(line) {
   try { return await executeRaw(line); } catch (e) { fail(e); return null; }
 }
 
-$('btnBake').onclick = () => execute(formatCommand(readOpts()));
+$('btnBake').onclick = () => execute(commandLine(readOpts()));
 $('btnRun').onclick = () => execute($('cmd').value);
 $('cmd').addEventListener('keydown', e => { if (e.key === 'Enter') execute($('cmd').value); });
 
 // ---------- playback ----------
 $('btnPlay').onclick = () => { if (viewer.playing) { viewer.pause(); $('btnPlay').textContent = 'Play'; } else { viewer.play(); $('btnPlay').textContent = 'Pause'; } };
 $('scrub').oninput = () => viewer.seek(($('scrub').value / 1000) * viewer.duration);
-$('trackSelect').onchange = () => { viewer.selectClip(+$('trackSelect').value); };
+$('trackSelect').onchange = () => { viewer.selectClip(+$('trackSelect').value); state.trackName = $('trackSelect').selectedOptions[0].textContent; };
 viewer.onTime(t => {
   const d = viewer.duration;
   if (document.activeElement !== $('scrub')) $('scrub').value = d ? (t / d) * 1000 : 0;
@@ -551,7 +684,7 @@ $('btnAiLabel').onclick = async () => {
       const src = bvhByCanon.get(label); if (!src) continue;
       state.map[canonical(bone)] = src; applied++;
     }
-    state.opts.mapFile = null; $('cmd').value = formatCommand(state.opts); renderMapping();
+    state.opts.mapFile = null; refreshCmd(); renderMapping();
     for (const r of rejected) log(`AI label rejected: ${r.bone} as ${r.label} (${r.reason})`, 'err');
     $('aiStatus').textContent = `${applied} label(s) passed the geometry check and were applied; ${rejected.length} rejected.`;
   } catch (e) { $('aiStatus').textContent = `Failed: ${e.message}`; }
@@ -560,7 +693,7 @@ $('btnAiLabel').onclick = async () => {
 $('btnAiCmd').onclick = async () => {
   try {
     const line = await ai.proposeCommand(state.ai, $('aiPrompt').value);
-    writeOpts({ ...parseCommand(line).opts, mapFile: state.opts.mapFile }); $('cmd').value = line;
+    writeOpts({ ...parseCommand(line).opts, mapFile: state.opts.mapFile, morphMapFile: state.opts.morphMapFile }); $('cmd').value = line;
     $('aiStatus').textContent = 'Command filled in above. Review it, then Run.';
   } catch (e) { $('aiStatus').textContent = `Failed: ${e.message}`; }
 };

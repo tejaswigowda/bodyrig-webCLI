@@ -45,11 +45,11 @@
             </div>
             <div class="drop-zone" id="dropMotion" tabindex="0">
               <strong>Animation tracks</strong>
-              <small>BVH, FBX or GLB<br>Drop or click. Add as many as you like; each becomes its own track.</small>
+              <small>BVH, FBX or GLB body motion, or face JSON (ARKit-52 face-record from mocap-webCLI)<br>Drop or click. Add as many as you like; each becomes a track or face record.</small>
             </div>
           </div>
           <input type="file" id="modelInput" data-testid="character-input" hidden accept=".fbx,.glb,.gltf,.vrm,.json">
-          <input type="file" id="motionInput" data-testid="motion-input" multiple hidden accept=".bvh,.fbx,.glb,.gltf">
+          <input type="file" id="motionInput" data-testid="motion-input" multiple hidden accept=".bvh,.fbx,.glb,.gltf,.json">
           <div class="chips" id="chips"></div>
           <button class="btn btn-ghost btn-sm" id="btnSample">Try with the sample (X Bot + 33 s mocap)</button>
         </div>
@@ -72,6 +72,7 @@
             <label><input type="checkbox" id="align" checked> Align reference pose</label>
             <label title="Pin planted feet and correct the legs with two-bone IK. Not used with In place."><input type="checkbox" id="footLock"> Foot lock + IK</label>
             <label><input type="checkbox" id="optimize" checked> Meshopt compress</label>
+            <label title="Experimental. Drive the head bone from a face record's head rotation (only with a face unit). Off by default; the axis convention is not yet verified against a real capture."><input type="checkbox" id="faceHead"> Head from face (experimental)</label>
           </div>
           <button class="btn btn-primary btn-block" id="btnBake" data-testid="bake" disabled>Bake &amp; export GLB</button>
         </div>

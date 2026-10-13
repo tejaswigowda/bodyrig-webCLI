@@ -9,7 +9,7 @@ import { parseBVH, motionFromBVH, motionsFromObject } from './mocap-bake.mjs';
 export const MODEL_EXT = /\.(fbx|glb|gltf|vrm|json)$/i;
 export const MOTION_EXT = /\.bvh$/i;
 export const MODEL_ACCEPT = '.fbx,.glb,.gltf,.vrm,.json';
-export const MOTION_ACCEPT = '.bvh,.fbx,.glb,.gltf';
+export const MOTION_ACCEPT = '.bvh,.fbx,.glb,.gltf,.json';
 
 // `role` says which upload a file came through: FBX / GLB / glTF can be a character or an animation source.
 export function classify(name, role) {
@@ -54,11 +54,21 @@ export async function loadModel(buf, name) {
   else if (/\.json$/i.test(name)) {
     const json = JSON.parse(new TextDecoder().decode(buf));
     model = await new THREE.ObjectLoader().parseAsync(json.scene ?? json);
-  } else { const gltf = await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).setDRACOLoader(dracoLoader()).parseAsync(buf, ''); model = gltf.scene; animations = gltf.animations; }
+  } else {
+    const gltf = await new GLTFLoader(manager).setMeshoptDecoder(MeshoptDecoder).setDRACOLoader(dracoLoader()).parseAsync(buf, '');
+    model = gltf.scene; animations = gltf.animations;
+    model.userData.frontSign = vrmFrontSign(gltf.parser?.json);
+  }
   await Promise.race([done, new Promise(r => setTimeout(r, 20000))]);
   const dropped = dropUnresolvedTextures(model);
   return { model, animations, dropped, ms: Math.round(performance.now() - t0) };
 }
+
+// VRM 0.x models face -Z; VRM 1.0 and plain glTF face +Z. The viewer uses this sign to put the camera on the front.
+const vrmFrontSign = json => {
+  const ext = json?.extensions ?? {};
+  return 'VRM' in ext && !('VRMC_vrm' in ext) ? -1 : 1;
+};
 
 export function loadMotion(text) {
   const t0 = performance.now();

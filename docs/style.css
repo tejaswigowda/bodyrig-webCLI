@@ -75,6 +75,7 @@ details.card[open] > summary::after { content: '\25BE'; }
 .chip .kind { font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--accent-h); min-width: 52px; }
 .chip .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip .meta { color: var(--muted); font-size: .72rem; }
+.chip .pair-select { width: auto; max-width: 150px; padding: 2px 6px; font-size: .72rem; }
 
 label.field { display: flex; flex-direction: column; gap: 4px; font-size: .72rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
 input[type=text], input[type=number], input[type=url], select, textarea { background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px; font-size: .85rem; width: 100%; text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--text); }

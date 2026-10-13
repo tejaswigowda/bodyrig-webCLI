@@ -332,6 +332,46 @@ function reskinFromClean(target, clean) {
   return true;
 }
 
+// Proximity ("automatic") skinning for a garment whose own weights cannot be trusted: weights are a smooth function of rest
+// position (distance to each core bone's segment), so layers that overlap (a jacket over trousers) move together and nothing tears.
+const ARM_PARTS = new Set(['LeftArm', 'RightArm', 'LeftForeArm', 'RightForeArm', 'LeftHand', 'RightHand']);
+function proximitySkin(sm, shared) {
+  sm.updateWorldMatrix(true, false);
+  const core = new Map(), depth = b => { let d = 0; for (let p = b.parent; p?.isBone; p = p.parent) d++; return d; };
+  for (const b of shared) { const c = canonical(b.name); if (CORE_BONES.includes(c) && (!core.has(c) || depth(b) > depth(core.get(c)))) core.set(c, b); }
+  if (core.size < 8) return false;
+  const wp = b => b.getWorldPosition(new THREE.Vector3()), segs = [];
+  for (const [c, b] of core) {
+    const kids = []; for (const [c2, b2] of core) { if (b2 === b) continue; for (let x = b2.parent; x?.isBone; x = x.parent) { if (x === b) { kids.push(b2); break; } if ([...core.values()].includes(x)) break; } }
+    const a = wp(b); let e;
+    if (kids.length) { e = new THREE.Vector3(); kids.forEach(k => e.add(wp(k))); e.multiplyScalar(1 / kids.length); }
+    else { const par = b.parent?.isBone ? wp(b.parent) : a.clone().add(new THREE.Vector3(0, -0.1, 0)); e = a.clone().add(a.clone().sub(par).multiplyScalar(0.6)); }
+    segs.push({ c, b, a, ab: e.clone().sub(a), len2: Math.max(e.distanceToSquared(a), 1e-8), arm: ARM_PARTS.has(c) });
+  }
+  const g = sm.geometry, pos = g.attributes.position, si = g.attributes.skinIndex, sw = g.attributes.skinWeight, v = new THREE.Vector3(), q = new THREE.Vector3();
+  const maps = [], armMemo = new Map();
+  const underArm = b => { let r = armMemo.get(b); if (r === undefined) { r = false; for (let x = b; x?.isBone; x = x.parent) if (ARM_PARTS.has(canonical(x.name))) { r = true; break; } armMemo.set(b, r); } return r; };
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(sm.matrixWorld);
+    let armish = false; for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > 0.05 && underArm(sm.skeleton.bones[si.getComponent(i, k)])) armish = true;
+    const ws = [];
+    for (const s of segs) {
+      if (s.arm && !armish) continue;
+      const t = Math.min(1, Math.max(0, q.copy(v).sub(s.a).dot(s.ab) / s.len2)), d = q.copy(s.a).addScaledVector(s.ab, t).distanceTo(v);
+      ws.push([s.b, 1 / (d + 0.01) ** 4]);
+    }
+    const top = ws.sort((x, y) => y[1] - x[1]).slice(0, 4), tot = top.reduce((t, x) => t + x[1], 0);
+    maps.push(new Map(top.map(([b, w]) => [b, w / tot])));
+  }
+  const root = topBone(sm.skeleton.bones[0]), bones = [root], slot = new Map([[root, 0]]);
+  const slotMaps = maps.map(m => new Map([...m].map(([b, w]) => { if (!slot.has(b)) { slot.set(b, bones.length); bones.push(b); } return [slot.get(b), w]; })));
+  const { idx, wts } = smoothWeights(g, slotMaps, 3, 0.5);
+  g.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(idx, 4));
+  g.setAttribute('skinWeight', new THREE.Float32BufferAttribute(wts, 4));
+  sm.bind(new THREE.Skeleton(bones, bones.map(b => b.matrixWorld.clone().invert())), sm.bindMatrix);
+  return true;
+}
+
 export function normalizeRig(model) {
   const skinned = []; model.traverse(o => { if (o.isSkinnedMesh) skinned.push(o); });
   if (!skinned.length) throw new Error('No SkinnedMesh found -- the model is not rigged.');
@@ -346,11 +386,11 @@ export function normalizeRig(model) {
   const seams = new Map(skinned.map(sm => [sm, seamGroups(sm)]));
   const noisy = sm => { const s = seams.get(sm); return s.total >= 20 && s.bad.length / s.total > 0.2; };
   const clean = skinned.filter(sm => seams.get(sm).total && !seams.get(sm).bad.length);
-  let weldedSeamVertices = 0, reskinnedMeshes = 0, smoothedMeshes = 0;
+  let weldedSeamVertices = 0, reskinnedMeshes = 0, smoothedMeshes = 0, proximityMeshes = 0; const fallback = [];
   for (const sm of skinned) {
     if (!seams.get(sm).bad.length) continue;
     if (noisy(sm) && reskinFromClean(sm, clean)) reskinnedMeshes++;
-    else { weldedSeamVertices += weldSeamWeights(sm, seams.get(sm).bad); if (noisy(sm)) { smoothOwnWeights(sm, 8, 0.3); smoothedMeshes++; } }
+    else { weldedSeamVertices += weldSeamWeights(sm, seams.get(sm).bad); if (noisy(sm)) fallback.push(sm); }
   }
   // glTF requires skin.skeleton (exported as bones[0]) to be a common root of all joints. Partial skins
   // (e.g. a "Body" mesh weighted from Spine2 up) violate that: move/insert the top root at index 0.
@@ -370,8 +410,10 @@ export function normalizeRig(model) {
   // include unskinned bones on the chain between skinned ones (e.g. a Spine1 no mesh weights to)
   for (const b of [...bones]) for (let p = b.parent; p?.isBone; p = p.parent) bones.add(p);
   const poseAll = () => { for (const sm of skinned) sm.skeleton.pose(); model.updateMatrixWorld(true); };
+  // no clean mesh to copy from: skin by bone proximity, or failing that smooth the garment's own weights
+  for (const sm of fallback) { if (proximitySkin(sm, bones)) proximityMeshes++; else { smoothOwnWeights(sm, 8, 0.3); smoothedMeshes++; } }
   const attachedMeshes = attachLooseMeshes(model, bones);
-  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed, mergedSkeletons, weldedSeamVertices, reskinnedMeshes, smoothedMeshes, attachedMeshes };
+  return { bones: [...bones], skinned, poseAll, skins: skinned.length, removedTwinBones: removed, mergedSkeletons, weldedSeamVertices, reskinnedMeshes, smoothedMeshes, proximityMeshes, attachedMeshes };
 }
 
 // `override` maps a target bone's canonical name -> source bone name; an empty string pins the bone to rest pose.

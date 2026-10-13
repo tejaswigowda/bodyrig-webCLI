@@ -64,6 +64,71 @@ Every track is retargeted independently with the same options and written to the
 
 FBX and GLB animation files are read as a skeleton plus its clips, so they can be animation-only exports (for example Mixamo "without skin") or a full character file. FBX animation files are not covered by the test suite (no fixture with a clip); GLB animation sources are.
 
+## Body and face units
+
+A **unit** is one clip in the exported GLB. It is one of three things:
+
+- **Body**: a body motion (BVH, FBX or GLB clip), retargeted onto the bones as before.
+- **Face**: a face recording, driving the character's ARKit-52 blendshapes (morph targets) over time. Face-only units need no body motion.
+- **Pair**: one body motion and one face recording on one timeline, baked into a single clip. The body moves the skeleton and the face moves the morphs.
+
+Any number of units can go into one GLB. Each unit is written as its own named animation (`walk.bvh`, `smile.json`, `walk.bvh+smile.json`), so you play them one at a time.
+
+### Face JSON
+
+The face input accepts the `face-record` JSON written by [mocap-webCLI](https://github.com/tejaswigowda/mocap-webCLI/):
+
+```json
+{ "type": "face-record", "schema": "arkit-52", "fps": 30, "t0": 0.0,
+  "channels": ["jawOpen", "eyeBlinkLeft", "..."],
+  "frames": [[0.0, 0.1, "..."], ["..."]],
+  "head": [[qx, qy, qz, qw], "..."] }
+```
+
+- `channels` names the ARKit-52 blendshapes. Each row of `frames` holds one weight (0 to 1) per channel, in the same order. Values outside 0 to 1 are clamped. Channels that are not ARKit-52 names are ignored, and the log lists them.
+- `head` (optional) is the head rotation per frame. It is used only with `--face-head`.
+- `t0` is the recording's start on the shared clock. Frame `i` is at `t0 + i / fps`. mocap-webCLI's `session.json` stores `t0` for the body and face, and the two files align at offset 0.
+- A body motion and a face record pair on one clock. Face samples are taken at the body's frame times; a body frame past the end of the recording holds the last face frame, and the log reports how many samples were held.
+
+Any other JSON dropped on the animation input is rejected, except a morph map (below) and a bone map (`--map`), which are recognized by their shape.
+
+### Blendshape status
+
+Blendshapes are read from the character's morph targets. The status is shown on the character chip and in the log, and it is one of:
+
+- **ok**: all 52 ARKit-52 names matched.
+- **partial**: some matched. Face channels that do not match are not baked, and the log lists examples of the missing ones.
+- **none**: no morph target matches. The character has no blendshapes for face animation, so a face unit can't be baked on it. A face unit paired with a body still bakes the body and reports the face as skipped. A face-only unit stops the bake with an error that says so.
+
+Morph target names are matched ignoring case and punctuation, so `eyeBlink_Left` matches `eyeBlinkLeft`. Names that differ more than that, such as `Blink_Left`, need a morph map:
+
+```json
+{ "eyeBlinkLeft": "Blink_Left", "eyeBlinkRight": "Blink_Right", "jawOpen": "Jaw_Open" }
+```
+
+Keys must be ARKit-52 names, and values are the character's morph target names. Pass the file with `--morph-map FILE`, or drop it on the page.
+
+The face is attached to the mesh that matches the most ARKit names (the log says which one). Meshes whose names are duplicated or not safe as track names are skipped. Head rotation from the face record is applied to the head bone only with `--face-head`. Its axis convention is unverified, so treat it as experimental.
+
+### Command syntax
+
+```
+bake walk.bvh                  body-only unit
+bake smile.json                face-only unit
+bake walk.bvh+smile.json       body + face pair, one clip
+bake walk.bvh+smile.json idle.bvh --morph-map map.json --face-head
+```
+
+- `a+b` needs exactly one `.json` part (the face) and one motion part (the body). `a.bvh+b.fbx` and `a.json+b.json` are errors. The order can be either way: `smile.json+walk.bvh` is the same pair.
+- A bare `walk.bvh` in a command is body-only, so it clears any pair the GUI had set for that file.
+- `bake` with no unit names uses every loaded track. A face that is not paired with any track becomes a face-only unit.
+- `--face-head` (off by default) drives the head bone from the face record's `head` rotation. Units without `head` data skip it, and the log says so.
+- `--trim` and `--fps` apply to every unit. For a face-only unit the window starts at the recording's start, and `--trim` is counted from there. In a pair, body time 0 is the recording's `t0`. `--loop`, `--in-place` and `--foot-lock` apply to the body only and are ignored for face-only units.
+
+### In the page
+
+Drop face JSON on the **Animation tracks** input. A face shows its own chip (the frame count, rate and ARKit channel count). Each track chip has a **face** selector. Choosing a face pairs it with that track, and the command line updates to the `a+b` form. The selector is saved per track, so every clip of an FBX or GLB file gets the same pair. Choose "no face" to unpair. Each unit is logged on its own line: its status, the face channels and the held samples.
+
 ## The four Web-CLI properties
 
 | Property | How it is met here |
@@ -92,14 +157,14 @@ Retargeting is geometry with a right answer, so the core pipeline is 100% determ
 ## Command reference
 
 ```
-bake [model] [motion ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock]
-     [--map FILE] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
+bake [model] [unit ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock]
+     [--map FILE] [--morph-map FILE] [--face-head] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
 map  [--map FILE]     auto-map bones and print the table
 inspect               stage-by-stage report of the last bake
 help | clear
 ```
 
-- `bake` with no file names uses the loaded character and every loaded track. Name a character and some motion files (`bake hero.glb walk.bvh run.fbx`) to embed only those.
+- `bake` with no unit names uses the loaded character and every loaded track, pairing each track with its face. Name a character and some units (`bake hero.glb walk.bvh run.fbx`, `bake hero.glb walk.bvh+smile.json`) to embed only those. See [Body and face units](#body-and-face-units).
 - `--trim 2:10`, `2:` and `:10` are all valid (seconds).
 - `--loop` makes the last frame equal the first; root travel resets unless combined with `--in-place`.
 - `--hide Outfits` leaves out every mesh whose name, or a parent group's name, contains `Outfits` (case-insensitive; separate several names with commas). It applies to the preview and the exported GLB, and the log says how many meshes matched. Use it to bake the bare body and add your own clothing afterwards.
@@ -182,6 +247,8 @@ npm test                    # unit tests, then the Playwright matrix
 npm run test:update-golden  # regenerate tests/golden after an intentional change
 ```
 
+`tests/unit.test.mjs` covers the command grammar, unit syntax, face-record parsing, name matching and blendshape status, plus face-only and body+face bakes on a synthetic rig with ARKit morph targets (the paired case uses `mocap-33s.bvh` when present).
+
 `tests/matrix.mjs` drives the real page in headless Chromium: characters (X Bot, Y Bot, a synthetic Blender-axis A-pose rig built in the page) times option variants (default, trim + in-place + 24 fps, no-optimize, foot lock). Each GLB must pass the **glTF validator with 0 errors**, stay under a **limb-direction error threshold** against the BVH source (mean 3 deg, p95 8 deg), keep its meshopt flag as requested, and match **golden joint positions**. It also runs a GUI smoke test (including progress indicators, multiple tracks, and removing a track and the character), a multi-track bake (BVH plus a GLB animation), an export-fidelity check for alpha modes, a live-stream round trip against a mock WebSocket device, the zero-egress assertion and an offline bake. Playwright never runs at runtime, since that would break zero egress.
 
 Current numbers on the committed fixtures (33 s of mocap, 994 frames at 30 fps):
@@ -199,13 +266,15 @@ Meshopt numbers depend on the texture content. A 3-texture Mixamo character (50 
 ## Honest limitations
 
 - Foot lock moves the legs only, never the pelvis, to meet a pinned foot. Where the pinned ankle is out of reach (about 6% of frames on the fixtures) the leg straightens and the foot slips instead of the hips dropping. Contact detection is a height and speed heuristic on the source ankles and assumes a flat floor and a Y-up source; it is skipped with `--in-place`, and with no mapped leg chain. Arms (hand planting) are not corrected.
-- Retargeting moves bones; it does not author skin weights. Duplicate vertices at one position (UV and normal seams) must share weights or a mesh tears along the seam. Where they disagree the weights are averaged, and a mesh where most seams disagree (a MetaHuman-style outfit export was like this) is re-skinned from the nearest vertices of a clean mesh on the same skeleton (the body) and smoothed, so tight clothing follows the body. When no clean mesh covers the garment (a clothed character whose body mesh is only hands and head), the garment's own weights are averaged across seams and smoothed over the mesh instead, which keeps the jacket and trousers continuous as the character moves. A garment vertex the file does not weight to any arm bone never takes its weights from an arm, so hands resting at the hips do not drag the hem. The load log says when this happened. Loose garments can still flare at the hem in extreme poses, as any linear-blend skin does.
+- Retargeting moves bones; it does not author skin weights. Duplicate vertices at one position (UV and normal seams) must share weights or a mesh tears along the seam. Where they disagree the weights are averaged, and a mesh where most seams disagree (a MetaHuman-style outfit export was like this) is re-skinned from the nearest vertices of a clean mesh on the same skeleton (the body) and smoothed, so tight clothing follows the body. When no clean mesh covers the garment (a clothed character whose body mesh is only hands and head), the garment is re-skinned by bone proximity instead: each vertex is weighted to the nearest core bones (arm bones only where the file itself weights it to the arm), then smoothed over the mesh. The weights are a function of position alone, so layers that overlap, such as a jacket over trousers, move together and neither tears nor lets the layer beneath show through. A garment vertex the file does not weight to any arm bone never takes its weights from an arm, so hands resting at the hips do not drag the hem. The load log says when this happened. Loose garments can still flare at the hem in extreme poses, as any linear-blend skin does.
 - Swing-only alignment fixes direction but not roll. Rigs whose rest roll differs from the BVH can twist forearms; a roll-match step or per-bone offset would cover it.
 - Bones the BVH has no counterpart for (for example a Mixamo `Spine2` against a BVH without it) hold their rest pose relative to their parent; the chain direction is still aligned through them.
 - FBXLoader is the least predictable stage (twin bones, units, external textures). GLB input is cleaner and recommended.
 - Large textured characters are texture-bound on export. Textures with alpha stay lossless PNG, and opaque ones are JPEG at the browser's default quality (about 0.92). Use `--max-tex 1024` on phones.
 - The meshopt-compressed GLB requires `EXT_meshopt_compression` and `KHR_mesh_quantization`. three.js, Babylon.js and model-viewer load it; other glTF viewers may not. Use `--no-optimize` (or untick **Meshopt compress**) for plain glTF 2.0 with no required extensions.
 - Skinned, animated GLBs from this tool have been reported not to open in macOS Preview / Quick Look, while static GLBs do; the cause is not identified yet.
+- Face: only the ARKit-52 `face-record` JSON format from mocap-webCLI is read. Blendshapes come from the character's morph targets, so a model without them gets no face (and the status says so). The face is not retargeted: weights are copied one to one, so a character whose blendshapes differ from ARKit's (different ranges or sculpting) will look different. Synthetic morph rigs are tested; a real ARKit-blendshape character has not been checked in this repo. Face-head rotation is unverified against a real capture.
+- Face-to-body alignment is at offset 0 on the shared clock. There is no per-file time offset; trim the files or edit `t0` in the JSON to shift one.
 - Rig breadth: tested on Mixamo, one VRoid VRM and synthetic A-pose / Blender-axis rigs. Untested on real Blender, Ready Player Me exports, twist/roll bones and non-humanoids.
 - Mesquite's BVH frame-time bug (declares 1/30 s but samples every 25 ms) is a Mesquite-side fix; a BVH with a wrong frame time will play too slow or fast here too.
 - BVH root position: three.js adds the root `OFFSET` to the position channels. Some exporters (Mesquite, Motive) write absolute positions that already equal the `OFFSET` on frame 0, which would double the root height. When the first frame matches the `OFFSET` this way, the channels are treated as absolute (the load log says so). A BVH whose first frame deliberately equals its offset under the additive convention is the one case this would misread.

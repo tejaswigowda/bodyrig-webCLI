@@ -24,18 +24,34 @@ export function createViewer(host) {
   new ResizeObserver(resize).observe(host); resize();
 
   // Frame from the scene's own bounds -- never a fixed magic-number pose.
+  // The camera sits on the model's front (userData.frontSign) and, when a Head bone exists, closes in on the head.
   function frame() {
     if (!model) return;
     model.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(model); if (box.isEmpty()) return;
     const size = box.getSize(new THREE.Vector3()), center = box.getCenter(new THREE.Vector3());
     const r = Math.max(size.length() / 2, 1e-3);
-    const dist = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.25;
+    const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+    const head = findHeadBone(model);
+    let target = center, dist = r / Math.sin(halfFov) * 1.25;
+    if (head) {
+      const hp = head.getWorldPosition(new THREE.Vector3());
+      const headH = size.y * 0.13;
+      target = new THREE.Vector3(hp.x, box.max.y - headH / 2, hp.z);
+      dist = (headH * 2.6) / (2 * Math.tan(halfFov));
+    }
+    const front = new THREE.Vector3(0.35, 0.25, 1 * (model.userData.frontSign ?? 1)).normalize();
     camera.near = r / 100; camera.far = r * 200; camera.updateProjectionMatrix();
-    controls.target.copy(center);
-    camera.position.copy(center).add(new THREE.Vector3(0.35, 0.25, 1).normalize().multiplyScalar(dist));
+    controls.target.copy(target);
+    camera.position.copy(target).add(front.multiplyScalar(dist));
     controls.update();
     grid.scale.setScalar(r * 6); grid.position.set(center.x, box.min.y, center.z);
+  }
+
+  function findHeadBone(root) {
+    let h = null;
+    root.traverse(o => { if (!h && o.isBone && /head$/i.test(o.name)) h = o; });
+    return h;
   }
 
   function setModel(m) {
@@ -44,10 +60,10 @@ export function createViewer(host) {
     scene.add(model); frame();
   }
 
-  function setClips(list, hipBone) {
+  function setClips(list, hipBone, index = 0) {
     clips = list; follow = hipBone ?? null;
     if (!mixer) mixer = new THREE.AnimationMixer(model);
-    selectClip(0);
+    selectClip(index);
   }
 
   function selectClip(i) {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCommand, formatCommand, parseTrim, DEFAULTS, PRESETS, EXAMPLES } from '../docs/js/command.js';
+import { parseCommand, formatCommand, parseTrim, parseUnit, DEFAULTS, PRESETS, EXAMPLES } from '../docs/js/command.js';
+import { ARKIT_52, isFaceRecord, parseFaceRecord, parseMorphMap, matchBlendshapes, blendshapeStatus, windowTimes } from '../docs/js/face.mjs';
 import { parseChannels, parseFrameMessage, resample, buildBVH, LiveRecorder } from '../docs/js/live.js';
 import { canonical, CORE_BONES, parseBVH, mapBones, normalizeRig } from '../docs/js/mocap-bake.mjs';
 import * as THREE from 'three';
@@ -8,6 +9,12 @@ import { validateLabels, describeBones } from '../docs/js/ai.js';
 import { explainReport } from '../docs/js/advice.js';
 import { isMapJSON, classify } from '../docs/js/loaders.js';
 import { buildSyntheticRig } from './synthetic-rig.mjs';
+import { runBake } from '../docs/js/pipeline.js';
+import { loadMotion } from '../docs/js/loaders.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseFaceRecord as parseRec } from '../docs/js/face.mjs';
 
 test('command: defaults and flags', () => {
   const p = parseCommand('bake --fps 60 --trim 2:10 --in-place --loop --map "my map.json" --no-optimize --max-tex 1024 --out a.glb');
@@ -275,4 +282,157 @@ test('normalizeRig: copies that both carry loader suffixes merge and get the pla
   assert.equal(rig.mergedSkeletons, 1);
   assert.deepEqual(rig.bones.map(b => b.name).sort(), ['head', 'pelvis', 'spine_01']);
   assert.equal(skins[0].skeleton.bones[0], skins[1].skeleton.bones[0]);
+});
+
+test('units: bare files, pairs, and bad pair syntax', () => {
+  assert.deepEqual(parseUnit('walk.bvh'), { token: 'walk.bvh', body: 'walk.bvh', face: null });
+  assert.deepEqual(parseUnit('smile.json'), { token: 'smile.json', body: null, face: 'smile.json' });
+  assert.deepEqual(parseUnit('walk.bvh+smile.json'), { token: 'walk.bvh+smile.json', body: 'walk.bvh', face: 'smile.json' });
+  assert.deepEqual(parseUnit('smile.json+walk.bvh'), { token: 'smile.json+walk.bvh', body: 'walk.bvh', face: 'smile.json' });
+  for (const bad of ['a.bvh+b.fbx', 'a.json+b.json', 'a+b', 'x.bvh+', '+x.json']) assert.throws(() => parseUnit(bad), undefined, bad);
+});
+
+test('units: positional pairs survive format round trip', () => {
+  const p = parseCommand('bake walk.bvh+smile.json idle.bvh --face-head --morph-map map.json');
+  assert.deepEqual(p.positional, ['walk.bvh+smile.json', 'idle.bvh']);
+  assert.equal(p.opts.faceHead, true);
+  assert.equal(p.opts.morphMapFile, 'map.json');
+  const again = parseCommand(formatCommand(p.opts, { motions: p.positional }));
+  assert.deepEqual(again.positional, p.positional);
+  assert.deepEqual(again.opts, p.opts);
+  assert.equal(parseCommand('bake').opts.faceHead, false);
+});
+
+const record = (over = {}) => ({
+  type: 'face-record', schema: 'arkit-52', fps: 30, t0: 0,
+  channels: ['jawOpen', 'eyeBlinkLeft', 'madeUpChannel'],
+  frames: [[0.2, 1.7, 0.5], [0.4, -0.3, 0.5]],
+  ...over,
+});
+
+test('face: record detection and parsing', () => {
+  assert.equal(isFaceRecord(record()), true);
+  assert.equal(isFaceRecord({ channels: [], frames: [] }), false);
+  const r = parseFaceRecord(record());
+  assert.deepEqual(r.channels, ['jawOpen', 'eyeBlinkLeft']);
+  assert.deepEqual(r.ignored, ['madeUpChannel']);
+  assert.deepEqual(r.frames[0], { jawOpen: 0.2, eyeBlinkLeft: 1 });
+  assert.deepEqual(r.frames[1], { jawOpen: 0.4, eyeBlinkLeft: 0 });
+  assert.throws(() => parseFaceRecord(record({ channels: ['madeUpChannel'], frames: [[0.1]] })));
+  assert.throws(() => parseFaceRecord(record({ frames: [[0.1, 0.2]] })));
+});
+
+test('face: name matching and morph maps', () => {
+  const direct = matchBlendshapes(['eyeBlink_Left', 'jawOpen', 'Blink_Right']);
+  assert.equal(direct.get('eyeBlinkLeft'), 'eyeBlink_Left');
+  assert.equal(direct.get('jawOpen'), 'jawOpen');
+  assert.equal(direct.has('eyeBlinkRight'), false);
+  const mapped = matchBlendshapes(['Blink_Right'], { eyeBlinkRight: 'Blink_Right' });
+  assert.equal(mapped.get('eyeBlinkRight'), 'Blink_Right');
+  assert.deepEqual(parseMorphMap({ eyeBlinkRight: 'Blink_Right' }), { eyeBlinkRight: 'Blink_Right' });
+  assert.throws(() => parseMorphMap({ notARKit: 'x' }));
+  assert.equal(ARKIT_52.length, 52);
+});
+
+test('face: blendshape status levels', () => {
+  const none = blendshapeStatus(new Map(), { meshName: null });
+  assert.equal(none.level, 'none');
+  assert.equal(none.matched, 0);
+  assert.equal(none.total, 52);
+  const all = blendshapeStatus(new Map(ARKIT_52.map(n => [n, n])), { meshName: 'Head' });
+  assert.equal(all.level, 'ok');
+  assert.equal(all.missing.length, 0);
+  const some = blendshapeStatus(new Map([['jawOpen', 'jawOpen']]), { meshName: 'Head' });
+  assert.equal(some.level, 'partial');
+  assert.equal(some.missing.length, 51);
+});
+
+test('face: window length mirrors body sampling', () => {
+  assert.equal(windowTimes(10, [2, 4], 30).n, 61);
+  assert.equal(windowTimes(10, null, 30).n, 301);
+  assert.throws(() => windowTimes(10, [2, 2.001], 30));
+});
+
+// GLTFExporter reads its binary output through FileReader, which Node does not provide.
+globalThis.self ??= globalThis;
+if (!globalThis.FileReader) globalThis.FileReader = class {
+  readAsArrayBuffer(blob) { blob.arrayBuffer().then(buf => { this.result = buf; this.onloadend?.(); }); }
+};
+
+const glbJson = buf => {
+  const dv = new DataView(buf.buffer ?? buf, buf.byteOffset ?? 0);
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(buf.buffer ?? buf, (buf.byteOffset ?? 0) + 20, dv.getUint32(12, true))));
+};
+
+const faceRecord = () => parseRec({
+  type: 'face-record', schema: 'arkit-52', fps: 30, t0: 0,
+  channels: ['jawOpen', 'eyeBlinkLeft'],
+  frames: Array.from({ length: 31 }, (_, i) => [i / 30, 1 - i / 30]),
+});
+
+// Give the synthetic Body mesh two ARKit morph targets, the way a blendshape export would.
+function addArkitMorphs(rig, names = ['jawOpen', 'eyeBlinkLeft']) {
+  let body = null; rig.traverse(o => { if (o.isMesh && o.name === 'Body') body = o; });
+  const pos = body.geometry.attributes.position;
+  body.geometry.morphAttributes.position = names.map(() => pos.clone());
+  body.morphTargetDictionary = Object.fromEntries(names.map((n, i) => [n, i]));
+  body.morphTargetInfluences = names.map(() => 0);
+  return body;
+}
+
+const bakeOpts = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, optimize: false, jpeg: false, maxTex: 0, level: 'medium', hide: null, faceHead: false };
+
+test('bake: face-only unit becomes a clip with morph weight channels', async () => {
+  const rig = await buildSyntheticRig();
+  addArkitMorphs(rig);
+  const res = await runBake({ model: rig, units: [{ body: null, face: { name: 'smile.json', record: faceRecord() } }], opts: bakeOpts });
+  assert.equal(res.clips.length, 1);
+  assert.equal(res.clip.name, 'smile.json');
+  assert.equal(res.report.units[0].face.status, 'baked');
+  assert.equal(res.report.units[0].face.channels, 2);
+  assert.equal(res.report.blendshapes.level, 'partial');
+  const gj = glbJson(res.glb), anim = gj.animations[0];
+  const weights = anim.channels.filter(c => c.target.path === 'weights');
+  assert.equal(weights.length, 1, 'GLTFExporter packs all morph tracks of a node into one weights channel');
+  const out = gj.accessors[anim.samplers[weights[0].sampler].output];
+  assert.equal(out.count, 31 * 2, 'one weight per frame per morph target');
+  assert.equal(res.report.frames, 31);
+  assert.equal(res.report.duration, 1);
+});
+
+test('bake: face-only unit with no matching morphs is rejected', async () => {
+  const rig = await buildSyntheticRig();
+  await assert.rejects(runBake({ model: rig, units: [{ body: null, face: { name: 'smile.json', record: faceRecord() } }], opts: bakeOpts }), /ARKit|morph/i);
+});
+
+const BVH_FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'mocap-33s.bvh');
+test('bake: body+face pair becomes one clip with bone and weight tracks', { skip: !fs.existsSync(BVH_FIXTURE) && 'mocap-33s.bvh fixture not present' }, async () => {
+  const rig = await buildSyntheticRig();
+  addArkitMorphs(rig);
+  const source = loadMotion(fs.readFileSync(BVH_FIXTURE, 'utf8')).source;
+  // A 2 s recording against a 33 s body clip: the face holds its last frame past the end and reports how many samples did.
+  const rec = parseRec({ type: 'face-record', schema: 'arkit-52', fps: 30, t0: 0, channels: ['jawOpen', 'eyeBlinkLeft'], frames: Array.from({ length: 61 }, (_, i) => [i / 60, 0.5]) });
+  const res = await runBake({ model: rig, units: [{ body: { name: 'mocap-33s.bvh', source }, face: { name: 'smile.json', record: rec } }], opts: bakeOpts });
+  assert.equal(res.clips.length, 1);
+  assert.equal(res.clip.name, 'mocap-33s.bvh+smile.json');
+  const u = res.report.units[0];
+  assert.equal(u.body, true);
+  assert.equal(u.face.status, 'baked');
+  assert.ok(u.face.outOfRange > 0, 'samples past the 2 s recording are held and counted');
+  const gj = glbJson(res.glb), anim = gj.animations[0];
+  assert.ok(anim.channels.some(c => c.target.path === 'rotation' || c.target.path === 'translation'), 'body tracks present');
+  assert.ok(anim.channels.some(c => c.target.path === 'weights'), 'face weight track present');
+});
+
+test('bake: paired face weights follow the recording, not a frozen first frame (epoch t0)', { skip: !fs.existsSync(BVH_FIXTURE) && 'mocap-33s.bvh fixture not present' }, async () => {
+  const rig = await buildSyntheticRig();
+  addArkitMorphs(rig);
+  const source = loadMotion(fs.readFileSync(BVH_FIXTURE, 'utf8')).source;
+  // Capture timestamps are epoch milliseconds, as in mocap-webCLI output.
+  const rec = parseRec({ type: 'face-record', schema: 'arkit-52', fps: 30, t0: 1791868839666, channels: ['jawOpen'], frames: Array.from({ length: 61 }, (_, i) => [i / 60]) });
+  const res = await runBake({ model: rig, units: [{ body: { name: 'mocap-33s.bvh', source }, face: { name: 'smile.json', record: rec } }], opts: bakeOpts });
+  const weightTracks = res.clip.tracks.filter(t => t.name.includes('morphTargetInfluences'));
+  assert.ok(weightTracks.length > 0, 'face weight tracks present');
+  const vals = weightTracks.flatMap(t => Array.from(t.values));
+  assert.ok(Math.max(...vals) - Math.min(...vals) > 0.5, 'jawOpen ramps from 0 to 1 over the first 2 s');
 });

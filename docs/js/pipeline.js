@@ -1,6 +1,8 @@
 // pipeline.js -- stages 2-7 end to end, shared by the GUI, the command box and the Playwright harness.
+import * as THREE from 'three';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
-import { bakeMocap } from './mocap-bake.mjs';
+import { bakeMocap, canonical } from './mocap-bake.mjs';
+import { findFaceMesh, blendshapeStatus, windowTimes, sampleFace, sampleHead, faceTracks, headTrack } from './face.mjs';
 
 export function downscaleTextures(model, max) {
   const seen = new Set(); let n = 0;
@@ -151,27 +153,91 @@ export async function exportGLB(model, clips, { optimize = true, level = 'medium
   return { glb, raw, rawBytes: raw.byteLength, stages };
 }
 
-// motions: [{ name, source }] -- every source is retargeted on its own and embedded as its own animation track.
-// map: canonical-name -> source bone name overrides (from the mapping panel or --map file), applied to every track.
-export async function runBake({ model, motions, opts = {}, map = {}, onProgress = () => {} }) {
+// A unit is one body motion, one face record, or both on one timeline. Every unit becomes one animation clip in the GLB.
+//   units: [{ body: { name, source } | null, face: { name, record } | null }]
+//   morphMap: ARKit-52 name -> morph target name (--morph-map). Callers that still pass `motions` get one body unit each.
+export async function runBake({ model, units, motions, opts = {}, map = {}, morphMap = {}, onProgress = () => {} }) {
+  units ??= motions.map(m => ({ body: { name: m.name, source: m.source }, face: null }));
+  if (!units.length) throw new Error('Nothing to bake.');
   const used = new Set();
   const unique = n => { let u = n, i = 2; while (used.has(u)) u = `${n}_${i++}`; used.add(u); return u; };
-  const steps = motions.length + 1 + (opts.optimize === false ? 0 : 1); // tracks, export, compression
+  const steps = units.length + 1 + (opts.optimize === false ? 0 : 1);
   let done = 0;
   const step = async label => { onProgress(done++ / steps, label); await new Promise(r => setTimeout(r)); }; // yield so the bar repaints
+  const hidden = new Set(meshesMatching(model, opts.hide));
+  const faceBest = units.some(u => u.face) ? findFaceMesh(model, { skip: o => hidden.has(o), morphMap }) : null;
+  const headBone = findHead(model);
+  const ctx = { model, opts, map, faceBest, headBone, restHead: headBone?.quaternion.clone() ?? null, unique };
   const baked = [];
-  for (const [i, m] of motions.entries()) {
-    await step(motions.length > 1 ? `Retargeting ${m.name} (${i + 1}/${motions.length})...` : `Retargeting ${m.name}...`);
-    try { baked.push(bakeMocap(model, m.source, { fps: opts.fps, trim: opts.trim, inPlace: opts.inPlace, loop: opts.loop, align: opts.align, footLock: opts.footLock, map, name: unique(m.name) })); }
-    catch (e) { throw motions.length > 1 ? new Error(`${m.name}: ${e.message}`) : e; }
+  for (const [i, u] of units.entries()) {
+    const label = unitLabel(u);
+    await step(units.length > 1 ? `Retargeting ${label} (${i + 1}/${units.length})...` : `Retargeting ${label}...`);
+    try { baked.push(bakeUnit(u, ctx)); }
+    catch (e) { throw units.length > 1 ? new Error(`${label}: ${e.message}`) : e; }
   }
   const clips = baked.map(b => b.clip);
-  const report = { ...baked[0].report, tracks: baked.map(b => ({ name: b.clip.name, frames: b.report.frames, duration: b.report.duration, mapped: b.report.mapped, bones: b.report.bones })) };
-  if (baked.length > 1) report.stages = baked.flatMap(b => b.report.stages.map(s => ({ ...s, name: `${s.name} [${b.clip.name}]` }))).sort((a, b) => a.n - b.n);
+  const bodies = baked.filter(b => b.body);
+  const report = { ...(bodies[0]?.body.report ?? emptyReport(model, opts)) };
+  report.tracks = baked.map(b => ({ name: b.clip.name, frames: b.frames, duration: b.duration, mapped: b.mapped, bones: b.bones }));
+  report.units = baked.map(b => b.info);
+  if (!bodies.length) Object.assign(report, { frames: Math.max(...baked.map(b => b.frames)), duration: Math.max(...baked.map(b => b.duration)), fps: opts.fps });
+  report.blendshapes = faceBest || units.some(u => u.face) ? blendshapeStatus(faceBest?.matched, { meshName: faceBest?.mesh.name }) : null;
+  if (bodies.length > 1) report.stages = bodies.flatMap(b => b.body.report.stages.map(s => ({ ...s, name: `${s.name} [${b.clip.name}]` }))).sort((a, b) => a.n - b.n);
   await step('Exporting GLB...');
   const exp = await exportGLB(model, clips, { ...opts, onOptimize: () => step('Compressing meshes and textures (meshopt)...') });
   report.stages.push(...exp.stages);
   return { clips, clip: clips[0], glb: exp.glb, raw: exp.raw, report, rawBytes: exp.rawBytes };
+}
+
+const unitLabel = u => (u.body && u.face ? `${u.body.name}+${u.face.name}` : (u.body?.name ?? u.face.name));
+
+function bakeUnit(u, { model, opts, map, faceBest, headBone, restHead, unique }) {
+  const { fps } = opts;
+  const name = unique(unitLabel(u));
+  let body = null, w;
+  if (u.body) {
+    w = windowTimes(u.body.source.clip.duration, opts.trim, fps);
+    body = bakeMocap(model, u.body.source, { fps, trim: opts.trim, inPlace: opts.inPlace, loop: opts.loop, align: opts.align, footLock: opts.footLock, map, name });
+  } else {
+    const rec = u.face.record;
+    w = windowTimes(rec.duration, opts.trim, fps);
+  }
+  const info = { name, body: !!u.body, face: null, head: null };
+  let faceTr = [], headTr = null;
+  if (u.face) {
+    const rec = u.face.record;
+    const usable = new Map([...(faceBest?.matched ?? [])].filter(([a]) => rec.channels.includes(a)));
+    if (!usable.size) {
+      const reason = !faceBest ? 'this model has no morph targets whose names match ARKit-52 (try --morph-map)'
+        : `none of the ${rec.channels.length} channels in ${u.face.name} match a morph target on this model (try --morph-map)`;
+      if (!u.body) throw new Error(`${reason}.`);
+      info.face = { status: 'skipped', channels: 0, outOfRange: 0, reason };
+    } else {
+      // Window times are relative to the recording's start; the record's t0 is an epoch, so it is added here once.
+      const faceT0 = rec.t0 + w.t0;
+      const s = sampleFace(rec, faceT0, w.times);
+      faceTr = faceTracks(faceBest.mesh, usable, w.times, s.samples);
+      info.face = { status: 'baked', channels: usable.size, outOfRange: s.outOfRange, reason: null };
+    }
+    if (opts.faceHead) {
+      if (!headBone) info.head = 'skipped: no head bone on this model';
+      else if (!rec.head) info.head = 'skipped: the face record has no head rotation';
+      else { headTr = headTrack(headBone.name, w.times, sampleHead(rec, rec.t0 + w.t0, w.times, restHead)); info.head = 'face'; }
+    }
+  }
+  let bodyTracks = body ? body.clip.tracks : [];
+  if (headTr) bodyTracks = bodyTracks.filter(t => t.name !== `${headBone.name}.quaternion`);
+  const duration = w.times[w.times.length - 1];
+  const clip = new THREE.AnimationClip(name, duration, [...bodyTracks, ...faceTr, ...(headTr ? [headTr] : [])]);
+  return { clip, body, info, frames: w.n, duration, mapped: body?.report.mapped ?? 0, bones: body?.report.bones ?? 0 };
+}
+
+// The head bone is the first bone canonical-named Head, the same rule bakeMocap uses for the body.
+const findHead = model => { let h = null; model.traverse(o => { if (!h && o.isBone && canonical(o.name) === 'Head') h = o; }); return h; };
+
+function emptyReport(model, opts) {
+  const bones = new Set(); model.traverse(o => { if (o.isSkinnedMesh) o.skeleton.bones.forEach(b => bones.add(b)); });
+  return { frames: 0, fps: opts.fps, duration: 0, mapped: 0, bones: bones.size, missingCore: [], unmapped: [], stages: [] };
 }
 
 export function bytesToBase64(buf) {
