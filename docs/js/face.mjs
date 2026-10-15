@@ -82,20 +82,25 @@ export function blendshapeStatus(matched, { meshName = null } = {}) {
   return { level, matched: n, total: ARKIT_52.length, missing, text };
 }
 
-// Finds the mesh whose morph targets match the most ARKit names. Skips meshes the caller excludes (e.g. --hide),
-// and skips names that three.js cannot bind as a track target (sanitized name differs, or a duplicate name).
+// Finds the mesh whose morph targets match the most ARKit names, plus every other usable mesh with the same morph set.
+// A VRM face is usually split into several meshes (skin, eyes, brows, mouth) that all carry the same 52 targets, so
+// the weights must drive all of them or only one part of the face moves. Skips meshes the caller excludes (e.g.
+// --hide), and skips names that three.js cannot bind as a track target (sanitized name differs, or a duplicate name).
 export function findFaceMesh(root, { skip = () => false, morphMap = {} } = {}) {
   const meshes = [];
   root.traverse(o => { if (o.isMesh && o.morphTargetDictionary && !skip(o)) meshes.push(o); });
   const counts = new Map();
   for (const m of meshes) counts.set(m.name, (counts.get(m.name) || 0) + 1);
+  const usable = meshes.filter(m => m.name && THREE.PropertyBinding.sanitizeNodeName(m.name) === m.name && counts.get(m.name) === 1);
   let best = null;
-  for (const m of meshes) {
-    const usable = m.name && THREE.PropertyBinding.sanitizeNodeName(m.name) === m.name && counts.get(m.name) === 1;
-    if (!usable) continue;
+  for (const m of usable) {
     const matched = matchBlendshapes(Object.keys(m.morphTargetDictionary), morphMap);
     if (!best || matched.size > best.matched.size) best = { mesh: m, matched };
   }
+  if (!best) return null;
+  const key = m => Object.keys(m.morphTargetDictionary).join('\n');
+  const bestKey = key(best.mesh);
+  best.meshes = usable.filter(m => key(m) === bestKey);
   return best;
 }
 
@@ -126,6 +131,14 @@ export function sampleFace(record, t0, times) {
   return { samples, outOfRange };
 }
 
+// Scales every morph weight by `strength` and clamps to 0-1, the range an authored morph target is defined over.
+// Values above 1 can only lift the mid-range; they cannot push a morph past its full authored shape.
+export function scaleFaceSamples(samples, strength) {
+  for (const values of samples.values())
+    for (let i = 0; i < values.length; i++) values[i] = Math.min(1, Math.max(0, values[i] * strength));
+  return samples;
+}
+
 // Head rotation samples (flat quaternions, xyzw), slerped on the same timeline. Each capture quaternion is converted
 // by a 180 degree turn about x, then applied to the rest pose: local = rest * convert(q). This axis convention is
 // unverified against a real capture, which is why --face-head is opt-in.
@@ -144,13 +157,15 @@ export function sampleHead(record, t0, times, restQuat = new THREE.Quaternion())
   return out;
 }
 
-// One NumberKeyframeTrack per matched target, bound to the mesh's node name.
-export function faceTracks(mesh, matched, times, samples) {
+// One NumberKeyframeTrack per matched target per mesh, each bound to that mesh's node name.
+export function faceTracks(meshes, matched, times, samples) {
   const tracks = [];
-  for (const [arkit, target] of matched) {
-    const values = samples.get(arkit);
-    if (!values) continue;
-    tracks.push(new THREE.NumberKeyframeTrack(`${mesh.name}.morphTargetInfluences[${target}]`, times, values));
+  for (const mesh of meshes) {
+    for (const [arkit, target] of matched) {
+      const values = samples.get(arkit);
+      if (!values || !(target in mesh.morphTargetDictionary)) continue;
+      tracks.push(new THREE.NumberKeyframeTrack(`${mesh.name}.morphTargetInfluences[${target}]`, times, values));
+    }
   }
   return tracks;
 }

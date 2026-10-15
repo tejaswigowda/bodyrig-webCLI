@@ -66,20 +66,23 @@ FBX and GLB animation files are read as a skeleton plus its clips, so they can b
 
 ## Body and face units
 
-A **unit** is one clip in the exported GLB. It is one of three things:
+A **unit** is one clip in the exported GLB, made from one file. There are two kinds, and they are never combined:
 
 - **Body**: a body motion (BVH, FBX or GLB clip), retargeted onto the bones as before.
-- **Face**: a face recording, driving the character's ARKit-52 blendshapes (morph targets) over time. Face-only units need no body motion.
-- **Pair**: one body motion and one face recording on one timeline, baked into a single clip. The body moves the skeleton and the face moves the morphs.
+- **Face**: a face recording (mocap-webCLI `face-record` JSON), driving the character's ARKit-52 blendshapes (morph targets) over time. A face unit needs no body motion and moves only the face.
 
-Any number of units can go into one GLB. Each unit is written as its own named animation (`walk.bvh`, `smile.json`, `walk.bvh+smile.json`), so you play them one at a time.
+Any number of units can go into one GLB. Each unit is written as its own named animation, so you play them one at a time. To get a body and a face moving together you would need a combined clip, which this tool does not produce. Units are kept separate on purpose.
+
+### Animation names
+
+Each unit's name is editable in the page. Click the name on a chip, type a new one, then press Enter or leave the field to commit (Escape reverts, and an empty name reverts). Press **Bake** to write the new name into the GLB and the track dropdown. The name is a GUI setting only. Command lines refer to file names, so `bake walk.bvh` still works after a rename.
 
 ### Face JSON
 
 The face input accepts the `face-record` JSON written by [mocap-webCLI](https://github.com/tejaswigowda/mocap-webCLI/):
 
 ```json
-{ "type": "face-record", "schema": "arkit-52", "fps": 30, "t0": 0.0,
+{ "type": "face-record", "schema": "arkit-52", "fps": 30, "t0": 1791868839666,
   "channels": ["jawOpen", "eyeBlinkLeft", "..."],
   "frames": [[0.0, 0.1, "..."], ["..."]],
   "head": [[qx, qy, qz, qw], "..."] }
@@ -87,8 +90,8 @@ The face input accepts the `face-record` JSON written by [mocap-webCLI](https://
 
 - `channels` names the ARKit-52 blendshapes. Each row of `frames` holds one weight (0 to 1) per channel, in the same order. Values outside 0 to 1 are clamped. Channels that are not ARKit-52 names are ignored, and the log lists them.
 - `head` (optional) is the head rotation per frame. It is used only with `--face-head`.
-- `t0` is the recording's start on the shared clock. Frame `i` is at `t0 + i / fps`. mocap-webCLI's `session.json` stores `t0` for the body and face, and the two files align at offset 0.
-- A body motion and a face record pair on one clock. Face samples are taken at the body's frame times; a body frame past the end of the recording holds the last face frame, and the log reports how many samples were held.
+- `t0` is the recording's start on the capture clock, in epoch milliseconds as mocap-webCLI writes it. Frame `i` is at `i / fps` seconds from the start. Only the offsets matter for the clip, so the epoch value does not affect the output.
+- A face unit's clip runs for the length of its recording. `--trim` is counted from the recording's start.
 
 Any other JSON dropped on the animation input is rejected, except a morph map (below) and a bone map (`--map`), which are recognized by their shape.
 
@@ -98,7 +101,7 @@ Blendshapes are read from the character's morph targets. The status is shown on 
 
 - **ok**: all 52 ARKit-52 names matched.
 - **partial**: some matched. Face channels that do not match are not baked, and the log lists examples of the missing ones.
-- **none**: no morph target matches. The character has no blendshapes for face animation, so a face unit can't be baked on it. A face unit paired with a body still bakes the body and reports the face as skipped. A face-only unit stops the bake with an error that says so.
+- **none**: no morph target matches. Body units bake normally. A face unit stops the bake with an error that says no morph target matches and suggests `--morph-map`.
 
 Morph target names are matched ignoring case and punctuation, so `eyeBlink_Left` matches `eyeBlinkLeft`. Names that differ more than that, such as `Blink_Left`, need a morph map:
 
@@ -108,26 +111,26 @@ Morph target names are matched ignoring case and punctuation, so `eyeBlink_Left`
 
 Keys must be ARKit-52 names, and values are the character's morph target names. Pass the file with `--morph-map FILE`, or drop it on the page.
 
-The face is attached to the mesh that matches the most ARKit names (the log says which one). Meshes whose names are duplicated or not safe as track names are skipped. Head rotation from the face record is applied to the head bone only with `--face-head`. Its axis convention is unverified, so treat it as experimental.
+The face is attached to the mesh that matches the most ARKit names, and every other usable mesh with the same morph set is driven too (a VRM face is split into skin, eyes, brows and mouth meshes that all carry the 52 targets). The log says which mesh was chosen. Meshes whose names are duplicated or not safe as track names are skipped. Head rotation from the face record is applied to the head bone only with `--face-head`. Its axis convention is unverified, so treat it as experimental.
 
 ### Command syntax
 
 ```
-bake walk.bvh                  body-only unit
-bake smile.json                face-only unit
-bake walk.bvh+smile.json       body + face pair, one clip
-bake walk.bvh+smile.json idle.bvh --morph-map map.json --face-head
+bake walk.bvh                       body-only unit
+bake smile.json                     face-only unit
+bake walk.bvh smile.json            two units, two clips
+bake walk.bvh smile.json --morph-map map.json --face-head
 ```
 
-- `a+b` needs exactly one `.json` part (the face) and one motion part (the body). `a.bvh+b.fbx` and `a.json+b.json` are errors. The order can be either way: `smile.json+walk.bvh` is the same pair.
-- A bare `walk.bvh` in a command is body-only, so it clears any pair the GUI had set for that file.
-- `bake` with no unit names uses every loaded track. A face that is not paired with any track becomes a face-only unit.
+- Each file is one unit. A `+` in a unit name is an error, because body and face are never combined: `bake walk.bvh+smile.json` is rejected, and `bake walk.bvh smile.json` is the way to write it.
+- `bake` with no unit names uses every loaded track, including face recordings.
 - `--face-head` (off by default) drives the head bone from the face record's `head` rotation. Units without `head` data skip it, and the log says so.
-- `--trim` and `--fps` apply to every unit. For a face-only unit the window starts at the recording's start, and `--trim` is counted from there. In a pair, body time 0 is the recording's `t0`. `--loop`, `--in-place` and `--foot-lock` apply to the body only and are ignored for face-only units.
+- `--face-strength N` (default `1.5`, range 0 to 3) multiplies every face weight before it is baked, then clamps the result to 0 to 1. Use `1` to play the record as recorded, `0` to turn the face off, and higher values to exaggerate a weak performance. The default lifts a typical jaw-open of 0.6 to about 0.9 and a smile of 0.96 to 1. Head rotation from `--face-head` is not affected.
+- `--trim` and `--fps` apply to every unit. `--loop`, `--in-place` and `--foot-lock` apply to body units only and are ignored for face-only units.
 
 ### In the page
 
-Drop face JSON on the **Animation tracks** input. A face shows its own chip (the frame count, rate and ARKit channel count). Each track chip has a **face** selector. Choosing a face pairs it with that track, and the command line updates to the `a+b` form. The selector is saved per track, so every clip of an FBX or GLB file gets the same pair. Choose "no face" to unpair. Each unit is logged on its own line: its status, the face channels and the held samples.
+Drop a face JSON on the **Animation tracks** input. Each face gets its own chip (the frame count, rate and ARKit channel count), and each body motion gets its own chip. Nothing is paired: choose a unit in the track dropdown to preview it, and each baked unit is logged on its own line with its status, face channels and strength.
 
 ## The four Web-CLI properties
 
@@ -158,13 +161,13 @@ Retargeting is geometry with a right answer, so the core pipeline is 100% determ
 
 ```
 bake [model] [unit ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock]
-     [--map FILE] [--morph-map FILE] [--face-head] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
+     [--map FILE] [--morph-map FILE] [--face-head] [--face-strength N] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg] [--hide NAME[,NAME]] [--out NAME]
 map  [--map FILE]     auto-map bones and print the table
 inspect               stage-by-stage report of the last bake
 help | clear
 ```
 
-- `bake` with no unit names uses the loaded character and every loaded track, pairing each track with its face. Name a character and some units (`bake hero.glb walk.bvh run.fbx`, `bake hero.glb walk.bvh+smile.json`) to embed only those. See [Body and face units](#body-and-face-units).
+- `bake` with no unit names uses the loaded character and every loaded track. Name a character and some units (`bake hero.glb walk.bvh run.fbx smile.json`) to embed only those. See [Body and face units](#body-and-face-units).
 - `--trim 2:10`, `2:` and `:10` are all valid (seconds).
 - `--loop` makes the last frame equal the first; root travel resets unless combined with `--in-place`.
 - `--hide Outfits` leaves out every mesh whose name, or a parent group's name, contains `Outfits` (case-insensitive; separate several names with commas). It applies to the preview and the exported GLB, and the log says how many meshes matched. Use it to bake the bare body and add your own clothing afterwards.
@@ -247,7 +250,7 @@ npm test                    # unit tests, then the Playwright matrix
 npm run test:update-golden  # regenerate tests/golden after an intentional change
 ```
 
-`tests/unit.test.mjs` covers the command grammar, unit syntax, face-record parsing, name matching and blendshape status, plus face-only and body+face bakes on a synthetic rig with ARKit morph targets (the paired case uses `mocap-33s.bvh` when present).
+`tests/unit.test.mjs` covers the command grammar, unit syntax, face-record parsing, name matching and blendshape status, plus body-only, face-only and separate body and face bakes on a synthetic rig with ARKit morph targets (the body case uses `mocap-33s.bvh` when present). The `+` rejection and the epoch `t0` handling are covered too.
 
 `tests/matrix.mjs` drives the real page in headless Chromium: characters (X Bot, Y Bot, a synthetic Blender-axis A-pose rig built in the page) times option variants (default, trim + in-place + 24 fps, no-optimize, foot lock). Each GLB must pass the **glTF validator with 0 errors**, stay under a **limb-direction error threshold** against the BVH source (mean 3 deg, p95 8 deg), keep its meshopt flag as requested, and match **golden joint positions**. It also runs a GUI smoke test (including progress indicators, multiple tracks, and removing a track and the character), a multi-track bake (BVH plus a GLB animation), an export-fidelity check for alpha modes, a live-stream round trip against a mock WebSocket device, the zero-egress assertion and an offline bake. Playwright never runs at runtime, since that would break zero egress.
 

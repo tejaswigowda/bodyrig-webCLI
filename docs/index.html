@@ -65,6 +65,7 @@
             <label class="field">Trim start (s)<input type="number" id="trimStart" min="0" step="0.1" placeholder="0"></label>
             <label class="field">Trim end (s)<input type="number" id="trimEnd" min="0" step="0.1" placeholder="end"></label>
             <label class="field">Max texture (px)<input type="number" id="maxTex" min="0" step="256" placeholder="original"></label>
+            <label class="field" title="Scales face morph weights before they are clamped to 0-1. 1 uses the raw recording values; the default 1.5 makes the subtle VRoid morphs read clearly. Face units only.">Face strength<input type="number" id="faceStrength" min="0" max="3" step="0.1" value="1.5"></label>
           </div>
           <div class="checks">
             <label><input type="checkbox" id="inPlace"> In place</label>

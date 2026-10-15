@@ -23,7 +23,6 @@ const state = {
   motions: [],                // animation tracks: { file, name, source, info, ms, text? } -- one per BVH, one per clip of an FBX / GLB
   mapTrack: 0,                // which track the mapping panel shows
   map: {}, last: null, busy: false, live: null, ai: null,
-  pairs: new Map(),           // body track file -> face file; the pair is one body + face unit
 };
 
 // ---------- agent contract: data-webcli-status + window.__webcli_result (same shape across the family) ----------
@@ -75,7 +74,7 @@ async function job(label, fn, info = {}) {
 function progress(j, fraction, label) { j.fraction = fraction; if (label) j.label = label; renderBusy(); }
 
 // ---------- options <-> UI <-> command ----------
-const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'level', 'inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead'];
+const optInputs = ['fps', 'trimStart', 'trimEnd', 'maxTex', 'faceStrength', 'level', 'inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead'];
 
 function readOpts() {
   const o = { ...state.opts };
@@ -83,6 +82,7 @@ function readOpts() {
   const s = $('trimStart').value, e = $('trimEnd').value;
   o.trim = s !== '' || e !== '' ? [s === '' ? 0 : +s, e === '' ? null : +e] : null;
   o.maxTex = Math.max(0, Math.round(+$('maxTex').value || 0));
+  o.faceStrength = $('faceStrength').value === '' ? DEFAULTS.faceStrength : Math.min(3, Math.max(0, +$('faceStrength').value || 0));
   o.level = $('level').value;
   for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead']) o[k] = $(k).checked;
   return o;
@@ -94,6 +94,7 @@ function writeOpts(o) {
   $('trimStart').value = state.opts.trim?.[0] || '';
   $('trimEnd').value = state.opts.trim?.[1] ?? '';
   $('maxTex').value = state.opts.maxTex || '';
+  $('faceStrength').value = state.opts.faceStrength;
   $('level').value = state.opts.level;
   for (const k of ['inPlace', 'loop', 'align', 'footLock', 'optimize', 'faceHead']) $(k).checked = state.opts[k];
   refreshCmd();
@@ -139,42 +140,49 @@ function logBlendshapes() {
 }
 const faceMeta = r => `${r.frames.length} frames at ${r.fps} fps, ${r.channels.length} ARKit channels`;
 
-// Command-line units: each track with its chosen face as `body+face`, then each face that is not paired as a face-only unit.
-// Empty until a face is loaded, so plain bakes keep the implicit "every loaded track" form.
+// Command-line units: one per loaded track file, then one per face record. Empty until a face is loaded, so plain bakes keep the implicit "every loaded track" form.
 function unitTokens() {
   const faces = faceNames();
   if (!faces.length) return [];
-  const paired = new Set(state.pairs.values());
-  const bodies = [...new Set(state.motions.map(m => m.file))].map(f => (state.pairs.get(f) ? `${f}+${state.pairs.get(f)}` : f));
-  return [...bodies, ...faces.filter(n => !paired.has(n))];
+  return [...new Set(state.motions.map(m => m.file)), ...faces];
 }
 
-function pairSelect(file) {
-  const s = document.createElement('select');
-  s.className = 'pair-select'; s.title = 'Face record to pair with this track (one body + face unit)';
-  s.setAttribute('aria-label', `Face paired with ${file}`);
-  s.append(new Option('no face', ''), ...faceNames().map(n => new Option(n, n)));
-  s.value = state.pairs.get(file) ?? '';
-  s.onchange = () => setPair(file, s.value || null);
-  return s;
+// Animation names label the GLB clips and the track picker. Command-line units still refer to files, so a rename never breaks a command.
+function nameField(value, title, onRename) {
+  const i = document.createElement('input');
+  i.type = 'text'; i.className = 'name-edit'; i.value = value; i.title = `${title} (edit to rename)`; i.setAttribute('aria-label', title);
+  i.onkeydown = e => { if (e.key === 'Enter') i.blur(); else if (e.key === 'Escape') { i.value = value; i.blur(); } };
+  i.onchange = () => { const v = i.value.trim(); if (v && v !== value) onRename(v); else i.value = value; };
+  return i;
 }
 
-function setPair(file, face) {
-  if (face) state.pairs.set(file, face); else state.pairs.delete(file);
-  state.last = null; refreshCmd(); renderChips();
-  log(face ? `paired ${file} with ${face}: one body + face unit` : `${file} has no face`, 'dim');
-  setStatus('Pairing changed. Press Bake to apply.');
+function renameMotion(m, label) {
+  const old = m.name;
+  m.name = label;
+  if (state.trackName === old) state.trackName = label;
+  state.last = null; renderChips();
+  log(`renamed ${old} to ${label}`, 'dim');
+  setStatus('Name changed. Press Bake to apply.');
+}
+
+function renameFace(file, label) {
+  const f = state.files.get(file);
+  const old = f.label ?? file;
+  f.label = label;
+  state.last = null; renderChips();
+  log(`renamed face ${old} to ${label}`, 'dim');
+  setStatus('Name changed. Press Bake to apply.');
 }
 
 function renderChips() {
   const rows = [];
   const removing = key => [...jobs].some(j => j.removing === key);
   if (state.modelName) rows.push({ kind: 'character', name: state.modelName, meta: `${state.loadInfo} · ${blendShort(faceMatch())}`, key: 'character', remove: removeCharacter });
-  state.motions.forEach(m => rows.push({ kind: 'track', name: m.name, meta: m.info, key: m.file, remove: () => removeMotionFile(m.file), pairFile: state.motions.find(x => x.file === m.file) === m ? m.file : null }));
+  state.motions.forEach(m => rows.push({ kind: 'track', name: m.name, meta: m.info, key: m.file, remove: () => removeMotionFile(m.file), rename: v => renameMotion(m, v) }));
   for (const [n, f] of state.files) {
     if (f.kind === 'map') rows.push({ kind: 'bone map', name: n, meta: `${Object.keys(f.map).length} entries` });
     else if (f.kind === 'morph') rows.push({ kind: 'morph map', name: n, meta: `${Object.keys(f.map).length} entries`, key: n, remove: () => removeAsset(n) });
-    else if (f.kind === 'face') rows.push({ kind: 'face', name: n, meta: faceMeta(f.record), key: n, remove: () => removeAsset(n) });
+    else if (f.kind === 'face') rows.push({ kind: 'face', name: f.label ?? n, meta: faceMeta(f.record), key: n, remove: () => removeAsset(n), rename: v => renameFace(n, v) });
   }
   for (const j of jobs) if (j.pending) rows.push({ kind: j.pending.kind, name: j.pending.name, meta: 'loading...', busy: true });
   $('chips').replaceChildren(...rows.map(r => {
@@ -184,7 +192,7 @@ function renderChips() {
     d.children[0].textContent = r.kind; d.children[1].textContent = r.name; d.children[2].textContent = removing(r.key) ? 'removing...' : r.meta ?? '';
     if (busy) { const s = document.createElement('span'); s.className = 'spinner'; d.appendChild(s); }
     else {
-      if (r.pairFile && faceNames().length) d.appendChild(pairSelect(r.pairFile));
+      if (r.rename) d.replaceChild(nameField(r.name, `Name of ${r.kind}`, r.rename), d.children[1]);
       if (r.remove) {
         const b = document.createElement('button'); b.className = 'rm'; b.textContent = '\u00d7'; b.title = `Remove ${r.name}`; b.setAttribute('aria-label', `Remove ${r.name}`);
         b.onclick = () => r.remove();
@@ -232,7 +240,6 @@ async function removeMotionFile(file) {
   try {
     await job(`Removing ${file}...`, async () => {
       state.motions = state.motions.filter(m => m.file !== file);
-      state.pairs.delete(file);
       state.mapTrack = Math.min(state.mapTrack, Math.max(0, state.motions.length - 1));
       state.last = null; renderMapping();
       log(`removed ${file}`, 'dim');
@@ -245,7 +252,6 @@ async function removeAsset(name) {
   try {
     await job(`Removing ${name}...`, async () => {
       state.files.delete(name);
-      for (const [body, face] of [...state.pairs]) if (face === name) state.pairs.delete(body);
       if (state.opts.morphMapFile === name) state.opts.morphMapFile = null;
       state.last = null;
       log(`removed ${name}`, 'dim');
@@ -475,8 +481,7 @@ function renderStages(report) {
 renderStages(null);
 
 // ---------- command execution ----------
-// Resolves the command's inputs into units. A unit is a body track, a face record, or both (`body+face`).
-// With no positional units, every loaded track is baked with its chosen face, and faces that are not paired become face-only units.
+// Resolves the command's inputs into units: one per body track or face record. With no positional units, every loaded track and face is baked.
 async function resolveUnits(p) {
   let modelChosen = false; const tokens = [];
   for (const n of p.positional) {
@@ -484,29 +489,24 @@ async function resolveUnits(p) {
     else tokens.push(n);
   }
   if (!state.model) throw new Error('No character loaded. Drop an FBX, GLB or VRM into Character.');
-  const units = [], bodyPairs = new Map();
+  const units = [];
   const faceOf = name => { const f = state.files.get(name); if (f?.kind !== 'face') throw new Error(`"${name}" is not a loaded face record. Drop a face JSON on the page first.`); return f.record; };
-  const unitFor = (m, face) => ({ body: { name: m.name, source: m.source }, face: face ? { name: face, record: faceOf(face) } : null });
+  const faceUnit = name => ({ label: state.files.get(name)?.label, body: null, face: { name, record: faceOf(name) } });
   const motionsOf = file => { const ms = state.motions.filter(m => m.file === file); if (!ms.length) throw new Error(`"${file}" is not loaded. Drop it on the page first.`); return ms; };
+  const bodyUnit = m => ({ body: { name: m.name, source: m.source }, face: null });
   if (!tokens.length) {
-    for (const m of state.motions) units.push(unitFor(m, state.pairs.get(m.file) ?? null));
-    const paired = new Set(state.pairs.values());
-    for (const n of faceNames()) if (!paired.has(n)) units.push({ body: null, face: { name: n, record: faceOf(n) } });
+    for (const m of state.motions) units.push(bodyUnit(m));
+    for (const n of faceNames()) units.push(faceUnit(n));
   } else for (const t of tokens) {
     const f = state.files.get(t);
-    if (t.includes('+')) {
-      const { body, face } = parseUnit(t);
-      for (const m of motionsOf(body)) units.push(unitFor(m, face));
-      bodyPairs.set(body, face);
-    }
-    else if (state.motions.some(m => m.file === t)) { for (const m of motionsOf(t)) units.push(unitFor(m, null)); bodyPairs.set(t, null); }
-    else if (f?.kind === 'face') units.push({ body: null, face: { name: t, record: f.record } });
+    if (state.motions.some(m => m.file === t)) for (const m of motionsOf(t)) units.push(bodyUnit(m));
+    else if (f?.kind === 'face') units.push(faceUnit(t));
     else if (f?.kind === 'map') throw new Error(`"${t}" is a bone map; pass it with --map.`);
     else if (f?.kind === 'morph') throw new Error(`"${t}" is a morph map; pass it with --morph-map.`);
     else throw new Error(`"${t}" is not loaded. Drop it on the page first.`);
   }
   if (!units.length) throw new Error('No animation loaded. Drop a BVH, FBX, GLB or face JSON into Animation tracks.');
-  return { units, bodyPairs: tokens.length ? bodyPairs : new Map() };
+  return units;
 }
 
 function applyMorphFile(name) {
@@ -558,8 +558,7 @@ function logUnit(u) {
 
 async function bake(p) {
   if (state.busy) throw new Error('A bake is already running.');
-  const { units, bodyPairs } = await resolveUnits(p);
-  for (const [file, face] of bodyPairs) { if (face) state.pairs.set(file, face); else state.pairs.delete(file); }
+  const units = await resolveUnits(p);
   writeOpts(p.opts);
   applyMapFile(p.opts.mapFile);
   applyMorphFile(p.opts.morphMapFile);

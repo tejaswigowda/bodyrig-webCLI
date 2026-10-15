@@ -1,7 +1,7 @@
 // Offline-first: precache the app shell and every vendored dependency; everything is same-origin, so nothing third-party is ever cached or fetched.
 // App code is fetched network-first (revalidated, so an edited file is never served stale) and falls back to the cache offline;
 // vendored files never change under the same name, so they are cache-first.
-const CACHE = 'bodyrig-webcli-v18';
+const CACHE = 'bodyrig-webcli-v21';
 const SHELL = [
   './', './index.html', './style.css', './manifest.json', './icon.svg',
   './js/app.js', './js/viewer.js', './js/loaders.js', './js/pipeline.js', './js/command.js', './js/mocap-bake.mjs', './js/face.mjs',

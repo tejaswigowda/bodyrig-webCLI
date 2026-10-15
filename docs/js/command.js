@@ -1,15 +1,15 @@
 // command.js -- the raw control surface. Pure functions (no DOM) so the GUI, the terminal box and tests share one grammar.
 //   bake [model] [unit ...] [--fps N] [--trim S:E] [--in-place] [--loop] [--no-align] [--foot-lock] [--map FILE]
-//        [--morph-map FILE] [--face-head] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg]
+//        [--morph-map FILE] [--face-head] [--face-strength N] [--optimize | --no-optimize] [--level medium|high] [--max-tex N] [--no-jpeg]
 //        [--hide NAME[,NAME]] [--out NAME]
-//   A unit is one file (body or face .json) or a pair written body+face, e.g. walk.bvh+smile.json.
+//   A unit is one file: a body motion or a face .json. Each unit is its own animation clip.
 //   map  [--map FILE]        auto-map and print the mapping table
 //   inspect                  print the stage-by-stage report of the last bake
 //   help | clear
 
-export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, mapFile: null, optimize: true, jpeg: true, level: 'medium', maxTex: 0, hide: null, out: null, morphMapFile: null, faceHead: false };
+export const DEFAULTS = { fps: 30, trim: null, inPlace: false, loop: false, align: true, footLock: false, mapFile: null, optimize: true, jpeg: true, level: 'medium', maxTex: 0, hide: null, out: null, morphMapFile: null, faceHead: false, faceStrength: 1.5 };
 export const COMMANDS = ['bake', 'map', 'inspect', 'help', 'clear'];
-const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'morph-map', 'level', 'max-tex', 'hide', 'out']);
+const VALUE_FLAGS = new Set(['fps', 'trim', 'map', 'morph-map', 'face-strength', 'level', 'max-tex', 'hide', 'out']);
 const BOOL_FLAGS = new Set(['in-place', 'loop', 'no-align', 'foot-lock', 'face-head', 'optimize', 'no-optimize', 'no-jpeg']);
 
 export function tokenize(line) {
@@ -26,16 +26,12 @@ export function parseTrim(v) {
   return [a, b];
 }
 
-// "walk.bvh" is a body-only unit, "smile.json" a face-only unit, "walk.bvh+smile.json" a body+face pair.
-// Face files are .json; anything else is a body. A unit holds at most one of each.
+// "walk.bvh" is a body-only unit, "smile.json" a face-only unit. Face files are .json; anything else is a body.
+// Body and face are never combined in one unit: bake them as separate units.
 export function parseUnit(token) {
-  const parts = token.split('+');
-  const isFace = p => /\.json$/i.test(p);
-  if (parts.length > 2 || parts.some(p => p === '')) throw new Error(`Unit "${token}" must be one body file, one face .json, or body+face (e.g. walk.bvh+smile.json)`);
-  if (parts.length === 2 && (parts.filter(isFace).length !== 1)) throw new Error(`Unit "${token}" must pair one body file with one face .json`);
-  const body = parts.find(p => !isFace(p)) ?? null;
-  const face = parts.find(isFace) ?? null;
-  return { token, body, face };
+  if (token.includes('+')) throw new Error(`Unit "${token}" combines two files. Units are one animation each: list the body and the face as separate units (e.g. walk.bvh smile.json)`);
+  const face = /\.json$/i.test(token);
+  return { token, body: face ? null : token, face: face ? token : null };
 }
 
 export function parseCommand(line) {
@@ -54,7 +50,7 @@ export function parseCommand(line) {
     } else if (BOOL_FLAGS.has(name)) flags[name] = true;
     else throw new Error(`Unknown flag --${name}`);
   }
-  for (const p of positional) if (p.includes('+')) parseUnit(p);
+  for (const p of positional) parseUnit(p);
   const opts = { ...DEFAULTS };
   if ('fps' in flags) {
     opts.fps = +flags.fps;
@@ -69,6 +65,10 @@ export function parseCommand(line) {
   if (flags.map) opts.mapFile = flags.map;
   if (flags['morph-map']) opts.morphMapFile = flags['morph-map'];
   if (flags['face-head']) opts.faceHead = true;
+  if ('face-strength' in flags) {
+    opts.faceStrength = +flags['face-strength'];
+    if (!Number.isFinite(opts.faceStrength) || opts.faceStrength < 0 || opts.faceStrength > 3) throw new Error(`--face-strength must be between 0 and 3, got "${flags['face-strength']}"`);
+  }
   if (flags['no-optimize']) opts.optimize = false;
   if (flags.optimize) opts.optimize = true;
   if ('level' in flags) {
@@ -101,6 +101,7 @@ export function formatCommand(opts, { model, motions = [] } = {}) {
   if (o.mapFile) parts.push('--map', q(o.mapFile));
   if (o.morphMapFile) parts.push('--morph-map', q(o.morphMapFile));
   if (o.faceHead) parts.push('--face-head');
+  if (o.faceStrength !== DEFAULTS.faceStrength) parts.push('--face-strength', o.faceStrength);
   if (!o.optimize) parts.push('--no-optimize');
   else if (o.level !== DEFAULTS.level) parts.push('--level', o.level);
   if (o.maxTex) parts.push('--max-tex', o.maxTex);
@@ -129,17 +130,17 @@ export const EXAMPLES = [
   { cmd: 'bake --foot-lock', note: 'Pin planted feet and bend the legs with two-bone IK; also keeps the hips at the right height.' },
   { cmd: 'bake --map map.json', note: 'Apply a saved bone map (drop it on the page or save one from the mapping panel).' },
   { cmd: 'bake --hide Outfits', note: 'Leave out every mesh whose name, or a parent group name, contains "Outfits" (preview and export).' },
-  { cmd: 'bake hero.glb walk.bvh+smile.json', note: 'One unit: the walk drives the body and smile.json drives the face, on the same timeline.' },
-  { cmd: 'bake hero.glb walk.bvh+smile.json run.fbx', note: 'Two units in one GLB: a paired walk+face and a body-only run.' },
+  { cmd: 'bake hero.glb walk.bvh smile.json', note: 'Two units in one GLB: walk.bvh is the body clip and smile.json the face clip, each playable on its own.' },
+  { cmd: 'bake hero.glb walk.bvh run.fbx smile.json', note: 'Three units in one GLB, one clip each.' },
   { cmd: 'bake hero.glb smile.json', note: 'Face-only unit: blendshapes only, the rest of the body keeps its pose.' },
-  { cmd: 'bake --morph-map names.json walk.bvh+smile.json', note: 'Map ARKit names to this model\'s morph targets when the names differ.' },
-  { cmd: 'bake --face-head walk.bvh+smile.json', note: 'Also drive the head from the capture\'s head rotation (experimental; axis convention unverified).' },
+  { cmd: 'bake --morph-map names.json smile.json', note: 'Map ARKit names to this model\'s morph targets when the names differ.' },
+  { cmd: 'bake --face-head smile.json', note: 'Also drive the head from the capture\'s head rotation (experimental; axis convention unverified).' },
   { cmd: 'map', note: 'Auto-map bones and print the table, including unmapped bones.' },
   { cmd: 'inspect', note: 'Show every pipeline stage of the last bake.' },
 ];
 
 export const HELP = `Commands
-  bake [model] [unit ...] [flags]     each unit is a body motion (BVH, FBX, GLB), a face .json, or body+face (walk.bvh+smile.json)
+  bake [model] [unit ...] [flags]     each unit is one body motion (BVH, FBX, GLB) or one face .json, baked as its own clip
   map  [--map FILE]               auto-map bones, print the table
   inspect                         stage-by-stage report of the last bake
   clear                           clear this log
@@ -154,6 +155,7 @@ Flags for bake
   --map FILE         bone map JSON (dropped or saved in this page)
   --morph-map FILE   ARKit-52 to morph-target name JSON, e.g. {"jawOpen": "Mouth_Open"}; only for face units
   --face-head        also drive the head bone from the face capture's head rotation (experimental); replaces the body head track
+  --face-strength N  scale face morph weights by N, clamped to 0-1 (default 1.5; 0 turns the face off, 1 uses the raw values)
   --optimize / --no-optimize   meshopt compression (default on)
   --level medium|high          meshopt level
   --max-tex N        downscale textures to at most N px

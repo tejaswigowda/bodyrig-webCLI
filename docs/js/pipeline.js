@@ -2,7 +2,8 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { bakeMocap, canonical } from './mocap-bake.mjs';
-import { findFaceMesh, blendshapeStatus, windowTimes, sampleFace, sampleHead, faceTracks, headTrack } from './face.mjs';
+import { findFaceMesh, blendshapeStatus, windowTimes, sampleFace, scaleFaceSamples, sampleHead, faceTracks, headTrack } from './face.mjs';
+import { DEFAULTS } from './command.js';
 
 export function downscaleTextures(model, max) {
   const seen = new Set(); let n = 0;
@@ -153,11 +154,11 @@ export async function exportGLB(model, clips, { optimize = true, level = 'medium
   return { glb, raw, rawBytes: raw.byteLength, stages };
 }
 
-// A unit is one body motion, one face record, or both on one timeline. Every unit becomes one animation clip in the GLB.
-//   units: [{ body: { name, source } | null, face: { name, record } | null }]
+// A unit is one body motion or one face record. Every unit becomes one animation clip in the GLB, named by its label.
+//   units: [{ label?, body: { name, source } | null, face: { name, record } | null }]
 //   morphMap: ARKit-52 name -> morph target name (--morph-map). Callers that still pass `motions` get one body unit each.
 export async function runBake({ model, units, motions, opts = {}, map = {}, morphMap = {}, onProgress = () => {} }) {
-  units ??= motions.map(m => ({ body: { name: m.name, source: m.source }, face: null }));
+  units ??= motions.map(m => ({ label: m.name, body: { name: m.name, source: m.source }, face: null }));
   if (!units.length) throw new Error('Nothing to bake.');
   const used = new Set();
   const unique = n => { let u = n, i = 2; while (used.has(u)) u = `${n}_${i++}`; used.add(u); return u; };
@@ -189,7 +190,7 @@ export async function runBake({ model, units, motions, opts = {}, map = {}, morp
   return { clips, clip: clips[0], glb: exp.glb, raw: exp.raw, report, rawBytes: exp.rawBytes };
 }
 
-const unitLabel = u => (u.body && u.face ? `${u.body.name}+${u.face.name}` : (u.body?.name ?? u.face.name));
+const unitLabel = u => u.label ?? u.body?.name ?? u.face.name;
 
 function bakeUnit(u, { model, opts, map, faceBest, headBone, restHead, unique }) {
   const { fps } = opts;
@@ -210,14 +211,14 @@ function bakeUnit(u, { model, opts, map, faceBest, headBone, restHead, unique })
     if (!usable.size) {
       const reason = !faceBest ? 'this model has no morph targets whose names match ARKit-52 (try --morph-map)'
         : `none of the ${rec.channels.length} channels in ${u.face.name} match a morph target on this model (try --morph-map)`;
-      if (!u.body) throw new Error(`${reason}.`);
-      info.face = { status: 'skipped', channels: 0, outOfRange: 0, reason };
+      throw new Error(`${reason}.`);
     } else {
       // Window times are relative to the recording's start; the record's t0 is an epoch, so it is added here once.
       const faceT0 = rec.t0 + w.t0;
       const s = sampleFace(rec, faceT0, w.times);
-      faceTr = faceTracks(faceBest.mesh, usable, w.times, s.samples);
-      info.face = { status: 'baked', channels: usable.size, outOfRange: s.outOfRange, reason: null };
+      scaleFaceSamples(s.samples, opts.faceStrength ?? DEFAULTS.faceStrength);
+      faceTr = faceTracks(faceBest.meshes, usable, w.times, s.samples);
+      info.face = { status: 'baked', channels: usable.size, outOfRange: s.outOfRange, strength: opts.faceStrength ?? DEFAULTS.faceStrength, reason: null };
     }
     if (opts.faceHead) {
       if (!headBone) info.head = 'skipped: no head bone on this model';
@@ -225,10 +226,8 @@ function bakeUnit(u, { model, opts, map, faceBest, headBone, restHead, unique })
       else { headTr = headTrack(headBone.name, w.times, sampleHead(rec, rec.t0 + w.t0, w.times, restHead)); info.head = 'face'; }
     }
   }
-  let bodyTracks = body ? body.clip.tracks : [];
-  if (headTr) bodyTracks = bodyTracks.filter(t => t.name !== `${headBone.name}.quaternion`);
   const duration = w.times[w.times.length - 1];
-  const clip = new THREE.AnimationClip(name, duration, [...bodyTracks, ...faceTr, ...(headTr ? [headTr] : [])]);
+  const clip = new THREE.AnimationClip(name, duration, [...(body?.clip.tracks ?? []), ...faceTr, ...(headTr ? [headTr] : [])]);
   return { clip, body, info, frames: w.n, duration, mapped: body?.report.mapped ?? 0, bones: body?.report.bones ?? 0 };
 }
 
